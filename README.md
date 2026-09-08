@@ -3,11 +3,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/Status-Production%20Ready-success.svg)]()
+[![Engine: pourpoint](https://img.shields.io/badge/Engine-pourpoint-blueviolet.svg)](https://github.com/CooperBigFoot/pourpoint)
 [![IIT Mandi](https://img.shields.io/badge/Institution-INCLINE%20%7C%20IIT%20Mandi-teal.svg)](https://incline.iitmandi.ac.in)
 
-> **High-performance, publication-grade hydrographic watershed delineation and morphometric analysis engine for Indian river basins and global hydrography.**
+> **High-performance, publication-grade hydrographic watershed delineation and morphometric analysis engine for Indian river basins and global hydrography, powered by the [`pourpoint`](https://github.com/CooperBigFoot/pourpoint) engine (by Nicolas Lazaro).**
 
-Developed for **INCLINE (IIT Mandi)**, this system performs instantaneous watershed delineation, river network stream routing, and rigorous scientific morphometric characterization in **sub-100 milliseconds**.
+Developed for **INCLINE (IIT Mandi)**, this system extends the `pourpoint` hydrographic engine to perform instantaneous watershed delineation, river network stream routing, and rigorous scientific morphometric characterization in **sub-100 milliseconds**.
 
 ---
 
@@ -221,9 +222,22 @@ Click **Export All (ZIP)** to download:
 
 ---
 
-## Citation & Acknowledgements
+## Attribution & Upstream Credits
 
-If you use this software for research or operational hydrologic forecasting, please cite:
+This system builds upon and extends the exceptional open-source work of:
+
+- **[`pourpoint`](https://github.com/CooperBigFoot/pourpoint)** by **Nicolas Lazaro**:
+  The core hydrographic delineation engine powering the topological directed acyclic graph (DAG) traversals, spatial unit resolution, HFX catchment reading, and polygon union algorithms. We extend `pourpoint` with publication-grade morphometric indices (Horton, Strahler, Schumm, Miller, Gravelius, Smith, Faniran), exact WGS84 geodesic perimeter integration, stream reach extraction, batch CSV processing, and an interactive GIS web platform.
+- **[Upstream Tech](https://upstream.tech/)**:
+  Developers of the **GRIT (Global River Hydrofabric)** dataset specification and the `hfx` crate.
+- **[Central Water Commission (CWC)](https://ffs.india-water.gov.in/)**, Ministry of Jal Shakti, Government of India:
+  For official river basin gauge station benchmarks and flood forecasting reference coordinates across Indian river basins.
+
+---
+
+## Citation
+
+If you use this software for research or operational hydrologic forecasting, please cite both this system and the underlying `pourpoint` engine:
 
 ```bibtex
 @software{incline_watershed_2026,
@@ -233,6 +247,14 @@ If you use this software for research or operational hydrologic forecasting, ple
   publisher = {GitHub},
   url = {https://github.com/Barbhuiya12/watershed_delineation}
 }
+
+@software{pourpoint_lazaro_2026,
+  author = {Lazaro, Nicolas},
+  title = {pourpoint: High-performance watershed delineation engine},
+  year = {2026},
+  publisher = {GitHub},
+  url = {https://github.com/CooperBigFoot/pourpoint}
+}
 ```
 
-*Built with Rust, GRIT Hydrofabric, and Leaflet.js.*
+*Built with Rust, pourpoint core, GRIT Hydrofabric, and Leaflet.js.*

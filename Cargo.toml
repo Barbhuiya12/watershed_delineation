@@ -11,8 +11,14 @@ hfx = "0.5.0"
 name = "incline-watershed-system"
 version = "1.0.0"
 edition = "2024"
-authors = ["INCLINE Watershed Delineation Team <incline@iitmandi.ac.in>"]
-description = "High-performance hydrographic watershed delineation and morphometric analysis system"
+authors = [
+    "INCLINE Watershed Delineation Team <incline@iitmandi.ac.in>",
+    "Nicolas Lazaro <pourpoint engine author>",
+]
+description = "High-performance hydrographic watershed delineation and morphometric analysis system, built on the pourpoint engine (by Nicolas Lazaro)"
+repository = "https://github.com/Barbhuiya12/watershed_delineation"
+homepage = "https://incline.iitmandi.ac.in"
+license = "MIT"
 
 [[bin]]
 name = "incline-watershed-system"

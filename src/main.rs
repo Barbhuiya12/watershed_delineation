@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║       INCLINE — High-Performance Watershed Delineation       ║");
     println!("║             IIT Mandi · Hydrographic Engine                  ║");
+    println!("║       Powered by pourpoint-core (by Nicolas Lazaro)          ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!("opening dataset {dataset} …");
     let t0 = Instant::now();
@@ -131,6 +132,7 @@ fn handle(
             let body = json!({
                 "system": "INCLINE Watershed Delineation System",
                 "institution": "IIT Mandi",
+                "engine": "pourpoint-core (by Nicolas Lazaro)",
                 "dataset": dataset,
                 "open_seconds": open_secs
             });

@@ -1083,9 +1083,10 @@ button { font-family: inherit; }
           </div>
         </div>
 
-        <div style="font-size: 11px; color: var(--text-dim); line-height: 1.5; border-top: 1px solid var(--border-default); padding-top: 12px;">
-          Engine: <strong>pourpoint 0.3.0</strong> (High-Performance Rust Core)<br>
-          Fabric: <strong>GRIT 2.0.0</strong> · Planetary HFX Mirror
+        <div style="font-size: 11px; color: var(--text-dim); line-height: 1.6; border-top: 1px solid var(--border-default); padding-top: 12px;">
+          Engine: <a href="https://github.com/CooperBigFoot/pourpoint" target="_blank" style="color: var(--primary); text-decoration: underline; font-weight: 600;">pourpoint</a> by Nicolas Lazaro<br>
+          Hydrofabric: <strong>GRIT HFX 0.3.0</strong> · Upstream Tech<br>
+          System &amp; Morphometrics: <strong>INCLINE (IIT Mandi)</strong>
         </div>
       </div>
     </aside>
@@ -1611,6 +1612,11 @@ function buildReportDOM(d, totalMs) {
         ])}
       </div>
     </details>
+
+    <div style="margin-top: 16px; padding: 10px 12px; background: var(--bg-hover); border-radius: 8px; font-size: 11px; color: var(--text-muted); line-height: 1.5; border: 1px solid var(--border-default);">
+      Delineation &amp; DAG traversal powered by <a href="https://github.com/CooperBigFoot/pourpoint" target="_blank" style="color: var(--primary); font-weight: 600; text-decoration: none;">pourpoint</a> (by Nicolas Lazaro).<br>
+      Morphometrics &amp; Portal developed for INCLINE, IIT Mandi.
+    </div>
   `;
 }
 
@@ -1657,7 +1663,10 @@ function generateMorphometricsCsv(d, basinName) {
     ["Delineation Engine Compute Time", "", numVal(d.timing.delineate_s * 1000, 0), "ms", "pourpoint-core Rust Engine"],
     ["Channel Reaches Query Time", "", numVal(d.timing.reaches_s * 1000, 0), "ms", "Spatial Index Traversal"],
     ["Hydrofabric Catchments Fetch Time", "", numVal(d.timing.fetch_units_s * 1000, 0), "ms", "Parquet Row-Group Streaming"],
-    ["Watershed Polygon Dissolve Time", "", numVal(d.timing.dissolve_s * 1000, 0), "ms", "WKB Union / PostGIS Topology"]
+    ["Watershed Polygon Dissolve Time", "", numVal(d.timing.dissolve_s * 1000, 0), "ms", "WKB Union / PostGIS Topology"],
+    ["Core Delineation Engine", "", "pourpoint-core (by Nicolas Lazaro)", "", "https://github.com/CooperBigFoot/pourpoint"],
+    ["Global Hydrofabric Dataset", "", "GRIT HFX 0.3.0 (Upstream Tech)", "", "https://upstream.tech/"],
+    ["Hydrological Platform", "", "INCLINE Watershed Delineation System", "", "https://incline.iitmandi.ac.in"]
   ];
 
   return rows.map(r => r.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(",")).join("\r\n");
