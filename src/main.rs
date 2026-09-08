@@ -335,12 +335,27 @@ fn delineate(engine: &Engine, q: &HashMap<String, String>) -> (u16, Value) {
 
     let shapes = multipolygon_to_shapes(&display_watershed);
 
+    let terminal_id = units.terminal();
+    let res_coord = [result.resolved_outlet().lon, result.resolved_outlet().lat];
+
+    let other_geom_refs: Vec<&geo::Geometry<f64>> = reaches
+        .reaches()
+        .iter()
+        .filter(|r| r.unit_id() != terminal_id)
+        .map(|r| r.geometry())
+        .collect();
+
     let reach_features: Vec<Value> = reaches
         .reaches()
         .iter()
         .filter_map(|reach| {
+            let base_geom = if reach.unit_id() == terminal_id {
+                truncate_terminal_reach(reach.geometry(), res_coord, &other_geom_refs)
+            } else {
+                reach.geometry().clone()
+            };
             // Strictly clip reach linework against the watershed polygon boundary
-            let clipped = clip_reach_geometry(reach.geometry(), &shapes);
+            let clipped = clip_reach_geometry(&base_geom, &shapes);
             let geom_json = line_json(&clipped);
             if geom_json.is_null() {
                 return None;
@@ -417,6 +432,122 @@ fn delineate(engine: &Engine, q: &HashMap<String, String>) -> (u16, Value) {
 /// so that the boundary matches the true watershed divide and reaches never protrude.
 fn display_tolerance(_area_km2: f64) -> f64 {
     0.0
+}
+
+/// Project point `p` onto line segment `[a, b]`, returning `(projected_point, t)`.
+fn project_point_to_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> ([f64; 2], f64) {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let len_sq = dx * dx + dy * dy;
+    if len_sq == 0.0 {
+        return (a, 0.0);
+    }
+    let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len_sq).clamp(0.0, 1.0);
+    ([a[0] + t * dx, a[1] + t * dy], t)
+}
+
+fn dist_sq(a: [f64; 2], b: [f64; 2]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    dx * dx + dy * dy
+}
+
+/// Truncate a terminal reach so that it terminates precisely at the resolved outlet point,
+/// discarding downstream overshoot and guaranteeing the stream tip connects to the outlet.
+fn truncate_terminal_reach(
+    geom: &geo::Geometry<f64>,
+    res_pt: [f64; 2],
+    other_reaches: &[&geo::Geometry<f64>],
+) -> geo::Geometry<f64> {
+    match geom {
+        geo::Geometry::LineString(ls) => {
+            if ls.0.len() < 2 {
+                return geom.clone();
+            }
+            let coords: Vec<[f64; 2]> = ls.0.iter().map(|c| [c.x, c.y]).collect();
+
+            // Find segment closest to res_pt
+            let mut best_seg = 0;
+            let mut best_d = f64::INFINITY;
+            for i in 0..(coords.len() - 1) {
+                let (proj, _) = project_point_to_segment(res_pt, coords[i], coords[i + 1]);
+                let d = dist_sq(res_pt, proj);
+                if d < best_d {
+                    best_d = d;
+                    best_seg = i;
+                }
+            }
+
+            // Determine which endpoint connects to upstream reaches
+            let mut min_d_start = f64::INFINITY;
+            let mut min_d_end = f64::INFINITY;
+            for o in other_reaches {
+                match o {
+                    geo::Geometry::LineString(ols) => {
+                        for pt in [ols.0.first(), ols.0.last()].into_iter().flatten() {
+                            let p = [pt.x, pt.y];
+                            min_d_start = min_d_start.min(dist_sq(coords[0], p));
+                            min_d_end = min_d_end.min(dist_sq(coords[coords.len() - 1], p));
+                        }
+                    }
+                    geo::Geometry::MultiLineString(omls) => {
+                        for ols in &omls.0 {
+                            for pt in [ols.0.first(), ols.0.last()].into_iter().flatten() {
+                                let p = [pt.x, pt.y];
+                                min_d_start = min_d_start.min(dist_sq(coords[0], p));
+                                min_d_end = min_d_end.min(dist_sq(coords[coords.len() - 1], p));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let start_is_upstream = if other_reaches.is_empty() {
+                dist_sq(coords[0], res_pt) >= dist_sq(coords[coords.len() - 1], res_pt) || best_seg > 0
+            } else {
+                min_d_start <= min_d_end
+            };
+
+            let mut new_coords: Vec<geo::Coord<f64>> = if start_is_upstream {
+                coords[0..=best_seg]
+                    .iter()
+                    .map(|p| geo::Coord { x: p[0], y: p[1] })
+                    .collect()
+            } else {
+                let mut rev: Vec<geo::Coord<f64>> = coords[(best_seg + 1)..]
+                    .iter()
+                    .map(|p| geo::Coord { x: p[0], y: p[1] })
+                    .collect();
+                rev.reverse();
+                rev
+            };
+
+            // Explicitly pin the final coordinate to the resolved outlet marker
+            new_coords.push(geo::Coord { x: res_pt[0], y: res_pt[1] });
+            geo::Geometry::LineString(geo::LineString::new(new_coords))
+        }
+        geo::Geometry::MultiLineString(mls) => {
+            let mut new_lines = Vec::new();
+            for ls in &mls.0 {
+                let geom_ls = geo::Geometry::LineString(ls.clone());
+                new_lines.push(truncate_terminal_reach(&geom_ls, res_pt, other_reaches));
+            }
+            let lines: Vec<geo::LineString<f64>> = new_lines
+                .into_iter()
+                .filter_map(|g| match g {
+                    geo::Geometry::LineString(l) if !l.0.is_empty() => Some(l),
+                    _ => None,
+                })
+                .collect();
+            if lines.len() == 1 {
+                geo::Geometry::LineString(lines.into_iter().next().unwrap())
+            } else {
+                geo::Geometry::MultiLineString(geo::MultiLineString::new(lines))
+            }
+        }
+        other => other.clone(),
+    }
 }
 
 /// Convert a `geo::MultiPolygon<f64>` into `i_overlay` shapes `Vec<Vec<Vec<[f64; 2]>>>`.

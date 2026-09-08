@@ -423,7 +423,7 @@ button { font-family: inherit; }
 .gmaps-layer-widget.open .gmaps-layer-tray { display: flex; }
 
 .tray-section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); }
-.tray-cards-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.tray-cards-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .tray-card {
   display: flex;
   flex-direction: column;
@@ -1105,6 +1105,14 @@ button { font-family: inherit; }
             <div class="tray-card-img" style="background: linear-gradient(135deg, #064e3b, #0f172a);"></div>
             <span class="tray-card-name">Satellite</span>
           </div>
+          <div class="tray-card" data-basemap="opentopo" id="bmOpenTopo">
+            <div class="tray-card-img" style="background: linear-gradient(135deg, #fef08a, #86efac);"></div>
+            <span class="tray-card-name">OpenTopo</span>
+          </div>
+          <div class="tray-card" data-basemap="osm" id="bmOsm">
+            <div class="tray-card-img" style="background: linear-gradient(135deg, #bae6fd, #93c5fd);"></div>
+            <span class="tray-card-name">OpenStreetMap</span>
+          </div>
           <div class="tray-card" data-basemap="relief" id="bmRelief">
             <div class="tray-card-img" style="background: linear-gradient(135deg, #fed7aa, #cbd5e1);"></div>
             <span class="tray-card-name">Terrain</span>
@@ -1130,6 +1138,20 @@ button { font-family: inherit; }
               <span>Stream Network</span>
             </span>
             <input type="checkbox" id="layerRivers" checked>
+          </label>
+          <label class="tray-overlay-row">
+            <span class="tray-swatch-badge">
+              <span class="tray-swatch" style="background: #38bdf8;"></span>
+              <span>Smooth River Curves</span>
+            </span>
+            <input type="checkbox" id="layerSmoothRivers" checked>
+          </label>
+          <label class="tray-overlay-row">
+            <span class="tray-swatch-badge">
+              <span class="tray-swatch" style="background: #0ea5e9;"></span>
+              <span>High-Res Waterways (OSM)</span>
+            </span>
+            <input type="checkbox" id="layerOsmWaterways">
           </label>
           <label class="tray-overlay-row">
             <span class="tray-swatch-badge">
@@ -1224,6 +1246,16 @@ const BASEMAPS = {
     name: "Satellite",
     bg: "linear-gradient(135deg, #064e3b, #0f172a)"
   },
+  opentopo: {
+    layer: L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", { maxZoom: 17, attribution: "OpenTopoMap &copy; OpenStreetMap, SRTM" }),
+    name: "OpenTopo",
+    bg: "linear-gradient(135deg, #fef08a, #86efac)"
+  },
+  osm: {
+    layer: L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }),
+    name: "OpenStreetMap",
+    bg: "linear-gradient(135deg, #bae6fd, #93c5fd)"
+  },
   relief: {
     layer: L.tileLayer(ESRI("World_Shaded_Relief"), { maxZoom: 13, attribution: "Esri" }),
     name: "Terrain",
@@ -1279,9 +1311,93 @@ const gRivers = L.layerGroup().addTo(map);
 const gOutlets = L.layerGroup().addTo(map);
 const gPin = L.layerGroup().addTo(map);
 
+// High-Resolution OpenStreetMap Waterway Overlay
+const gOsmWaterways = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  opacity: 0.65,
+  attribution: "OSM Waterways &copy; OpenStreetMap"
+});
+
 $("layerBasin").addEventListener("change", e => e.target.checked ? gBasin.addTo(map) : map.removeLayer(gBasin));
 $("layerRivers").addEventListener("change", e => e.target.checked ? gRivers.addTo(map) : map.removeLayer(gRivers));
 $("layerOutlets").addEventListener("change", e => e.target.checked ? gOutlets.addTo(map) : map.removeLayer(gOutlets));
+
+$("layerOsmWaterways").addEventListener("change", e => {
+  if (e.target.checked) {
+    gOsmWaterways.addTo(map);
+    gOsmWaterways.bringToFront();
+    gRivers.bringToFront();
+    gBasin.bringToFront();
+    gOutlets.bringToFront();
+  } else {
+    map.removeLayer(gOsmWaterways);
+  }
+});
+
+$("layerSmoothRivers").addEventListener("change", () => {
+  if (CURRENT_DATA && CURRENT_DATA.geometry) {
+    renderReaches(CURRENT_DATA.geometry.reaches);
+  }
+});
+
+/* ── Chaikin Spline Smoothing for Streamlines ── */
+function chaikinSmooth(coords, iterations = 2) {
+  if (!coords || coords.length <= 2) return coords;
+  let current = coords;
+  for (let it = 0; it < iterations; it++) {
+    const next = [current[0]];
+    for (let i = 0; i < current.length - 1; i++) {
+      const p0 = current[i];
+      const p1 = current[i + 1];
+      next.push([0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1]]);
+      next.push([0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1]]);
+    }
+    next.push(current[current.length - 1]);
+    current = next;
+  }
+  return current;
+}
+
+function chaikinSmoothGeoJson(geo) {
+  if (!geo) return geo;
+  const copy = JSON.parse(JSON.stringify(geo));
+  if (copy.type === "FeatureCollection" && Array.isArray(copy.features)) {
+    copy.features.forEach(f => {
+      if (f.geometry) f.geometry = chaikinSmoothGeometry(f.geometry);
+    });
+  } else if (copy.type === "Feature" && copy.geometry) {
+    copy.geometry = chaikinSmoothGeometry(copy.geometry);
+  } else if (copy.type === "LineString" || copy.type === "MultiLineString") {
+    return chaikinSmoothGeometry(copy);
+  }
+  return copy;
+}
+
+function chaikinSmoothGeometry(geom) {
+  if (geom.type === "LineString") {
+    return { ...geom, coordinates: chaikinSmooth(geom.coordinates) };
+  } else if (geom.type === "MultiLineString") {
+    return { ...geom, coordinates: geom.coordinates.map(line => chaikinSmooth(line)) };
+  }
+  return geom;
+}
+
+function renderReaches(reachesData) {
+  gRivers.clearLayers();
+  if (!reachesData) return;
+  const shouldSmooth = $("layerSmoothRivers") && $("layerSmoothRivers").checked;
+  const processed = shouldSmooth ? chaikinSmoothGeoJson(reachesData) : reachesData;
+  L.geoJSON(processed, {
+    style: f => ({
+      color: f.properties.stem_role === "mainstem" ? "#0284c7" : "#38bdf8",
+      weight: f.properties.stem_role === "mainstem" ? 2.4 : 1.5,
+      opacity: 0.95
+    }),
+    onEachFeature: (f, l) => {
+      l.bindTooltip(`Unit: ${f.properties.unit_id} · ${f.properties.stem_role || "reach"} · ${f.properties.length_km.toFixed(2)} km`);
+    }
+  }).addTo(gRivers);
+}
 
 /* ── Sidebar Drawers ── */
 const leftDrawer = $("leftDrawer");
@@ -1429,17 +1545,8 @@ function renderResults(d, ms) {
     }
   }).addTo(gBasin);
 
-  // River network linework
-  L.geoJSON(d.geometry.reaches, {
-    style: f => ({
-      color: f.properties.stem_role === "mainstem" ? "#0284c7" : "#38bdf8",
-      weight: f.properties.stem_role === "mainstem" ? 2.3 : 1.4,
-      opacity: 0.92
-    }),
-    onEachFeature: (f, l) => {
-      l.bindTooltip(`Unit: ${f.properties.unit_id} · ${f.properties.stem_role || "reach"} · ${f.properties.length_km.toFixed(2)} km`);
-    }
-  }).addTo(gRivers);
+  // River network linework (with high-resolution spline smoothing)
+  renderReaches(d.geometry.reaches);
 
   // Requested outlet marker
   L.circleMarker([d.input.lat, d.input.lon], {
@@ -1968,9 +2075,11 @@ async function runBatchDelineation() {
         bLayer.addTo(gBatchBasins);
         try { allBounds.push(bLayer.getBounds()); } catch (e) {}
 
-        // Draw rivers
-        L.geoJSON(data.geometry.reaches, {
-          style: { color, weight: 1.6, opacity: 0.85 }
+        // Draw rivers (with optional smoothing)
+        const shouldSmoothBatch = $("layerSmoothRivers") && $("layerSmoothRivers").checked;
+        const batchReaches = shouldSmoothBatch ? chaikinSmoothGeoJson(data.geometry.reaches) : data.geometry.reaches;
+        L.geoJSON(batchReaches, {
+          style: { color, weight: 1.6, opacity: 0.88 }
         }).addTo(gBatchRivers);
 
         // Marker
