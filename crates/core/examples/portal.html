@@ -1,0 +1,2152 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>INCLINE — Watershed Delineation</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+:root {
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --primary-wash: rgba(37, 99, 235, 0.12);
+  --success: #059669;
+  --success-hover: #047857;
+  --success-wash: rgba(5, 150, 105, 0.12);
+  --warning: #d97706;
+  --warning-wash: rgba(217, 119, 6, 0.12);
+  --danger: #dc2626;
+  --danger-wash: rgba(220, 38, 38, 0.12);
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+
+[data-theme="light"] {
+  --bg-app: #f8fafc;
+  --bg-surface: #ffffff;
+  --bg-surface-elevated: #ffffff;
+  --bg-subtle: #f1f5f9;
+  --bg-hover: #e2e8f0;
+  --border-subtle: #f1f5f9;
+  --border-default: #e2e8f0;
+  --border-active: #cbd5e1;
+  --text-main: #0f172a;
+  --text-muted: #475569;
+  --text-dim: #94a3b8;
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 10px -1px rgba(0, 0, 0, 0.08), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  --shadow-lg: 0 14px 30px -4px rgba(0, 0, 0, 0.14), 0 4px 10px -2px rgba(0, 0, 0, 0.05);
+  --shadow-drawer: 0 16px 36px rgba(15, 23, 42, 0.14);
+  --glass-bg: rgba(255, 255, 255, 0.90);
+  --glass-border: rgba(226, 232, 240, 0.8);
+  --kpi-bg: #f8fafc;
+}
+
+[data-theme="dark"] {
+  --bg-app: #090d16;
+  --bg-surface: #0f172a;
+  --bg-surface-elevated: #1e293b;
+  --bg-subtle: #141e33;
+  --bg-hover: #1e293b;
+  --border-subtle: #1e293b;
+  --border-default: #25334d;
+  --border-active: #3b82f6;
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --text-dim: #64748b;
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 16px 36px rgba(0, 0, 0, 0.6);
+  --shadow-drawer: 0 16px 40px rgba(0, 0, 0, 0.7);
+  --glass-bg: rgba(15, 23, 42, 0.90);
+  --glass-border: rgba(37, 51, 77, 0.7);
+  --kpi-bg: #141e33;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; width: 100%; overflow: hidden; font-family: var(--font-sans); background: var(--bg-app); color: var(--text-main); font-size: 13.5px; -webkit-font-smoothing: antialiased; }
+button { font-family: inherit; }
+
+/* ── App Shell ── */
+.app-shell { display: flex; flex-direction: column; height: 100vh; width: 100vw; position: relative; }
+
+/* ── Top Navbar (INCLINE Brand) ── */
+.navbar {
+  height: 60px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border-default);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  z-index: 1100;
+  flex-shrink: 0;
+}
+.nav-left { display: flex; align-items: center; gap: 16px; }
+.incline-logo { display: flex; align-items: center; gap: 11px; text-decoration: none; color: inherit; }
+.logo-badge {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: conic-gradient(from 180deg, #ff9933 0deg, #ff9933 120deg, #ffffff 120deg, #ffffff 240deg, #138808 240deg, #138808 360deg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2.5px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+}
+.logo-inner {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-surface);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 11px;
+  color: #059669;
+  letter-spacing: -0.04em;
+}
+.logo-text { font-weight: 800; font-size: 17px; letter-spacing: -0.03em; color: var(--text-main); }
+.module-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--primary);
+  background: var(--primary-wash);
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(37, 99, 235, 0.2);
+}
+.module-badge svg { flex-shrink: 0; }
+
+.nav-links { display: flex; align-items: center; gap: 6px; margin-left: 10px; }
+.nav-item {
+  color: var(--text-muted);
+  text-decoration: none;
+  font-weight: 500;
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  transition: all 0.15s ease;
+}
+.nav-item:hover { color: var(--text-main); background: var(--bg-hover); }
+
+.nav-right { display: flex; align-items: center; gap: 10px; }
+.engine-chip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  padding: 5px 12px;
+  border-radius: 9999px;
+  white-space: nowrap;
+}
+.pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+}
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.icon-btn:hover { color: var(--text-main); background: var(--bg-hover); border-color: var(--border-active); }
+.login-btn {
+  background: var(--primary);
+  color: #ffffff;
+  border: none;
+  font-weight: 600;
+  font-size: 12.5px;
+  padding: 7px 16px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 1px 3px rgba(37, 99, 235, 0.3);
+}
+.login-btn:hover { background: var(--primary-hover); transform: translateY(-0.5px); }
+
+/* ── Main Viewport (Map + Floating Drawers) ── */
+.map-viewport { position: relative; flex: 1; width: 100%; min-height: 0; }
+#map { width: 100%; height: 100%; background: var(--bg-app); cursor: crosshair; }
+
+/* ── Floating Parameters Drawer (Left) ── */
+.drawer-left {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  bottom: 16px;
+  width: 330px;
+  max-width: calc(100vw - 32px);
+  background: var(--glass-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border-default);
+  border-radius: 14px;
+  box-shadow: var(--shadow-drawer);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  overflow: visible;
+}
+.drawer-left.collapsed { transform: translateX(calc(-100% - 20px)); }
+
+.drawer-toggle-btn {
+  position: absolute;
+  top: 18px;
+  right: -32px;
+  width: 28px;
+  height: 38px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border-default);
+  border-left: none;
+  border-radius: 0 8px 8px 0;
+  box-shadow: 3px 2px 8px rgba(0, 0, 0, 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: all 0.15s;
+  z-index: 1001;
+}
+.drawer-toggle-btn:hover { color: var(--primary); background: var(--bg-surface); }
+.drawer-left.collapsed .drawer-toggle-btn svg { transform: rotate(180deg); }
+
+.drawer-scroll { flex: 1; overflow-y: auto; padding: 20px 18px; display: flex; flex-direction: column; gap: 18px; }
+.drawer-scroll::-webkit-scrollbar { width: 5px; }
+.drawer-scroll::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 99px; }
+
+.drawer-header { border-bottom: 1px solid var(--border-default); padding-bottom: 14px; }
+.drawer-title { font-size: 16.5px; font-weight: 700; letter-spacing: -0.02em; color: var(--text-main); display: flex; align-items: center; gap: 8px; }
+.drawer-subtitle { font-size: 12px; color: var(--text-muted); margin-top: 3px; line-height: 1.4; }
+
+/* ── Form Controls ── */
+.form-section { display: flex; flex-direction: column; gap: 10px; }
+.section-heading { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
+
+.coord-group { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.input-wrap { display: flex; flex-direction: column; gap: 4px; }
+.input-label { font-size: 11px; font-weight: 600; color: var(--text-muted); }
+.input-field {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  background: var(--bg-surface);
+  color: var(--text-main);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  padding: 8px 10px;
+  transition: all 0.15s ease;
+}
+.input-field:hover { border-color: var(--border-active); }
+.input-field:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-wash); }
+
+.hint-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  padding: 8px 10px;
+  line-height: 1.4;
+}
+.hint-box svg { flex-shrink: 0; color: var(--primary); }
+
+.btn-primary {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: var(--primary);
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  padding: 11px 16px;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 2px 4px rgba(37, 99, 235, 0.25);
+}
+.btn-primary:hover { background: var(--primary-hover); transform: translateY(-0.5px); box-shadow: 0 4px 10px rgba(37, 99, 235, 0.35); }
+.btn-primary:disabled { opacity: 0.55; cursor: not-allowed; transform: none; box-shadow: none; }
+
+.btn-secondary {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.btn-secondary:hover { color: var(--text-main); background: var(--bg-hover); border-color: var(--border-active); }
+
+/* ── Export Action Row ── */
+.export-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.btn-export {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--success);
+  color: #ffffff;
+  border: none;
+  border-radius: 7px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 1px 3px rgba(5, 150, 105, 0.2);
+}
+.btn-export:hover { background: var(--success-hover); transform: translateY(-0.5px); box-shadow: 0 3px 8px rgba(5, 150, 105, 0.3); }
+.btn-export:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.auto-engine-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.auto-engine-badge svg { flex-shrink: 0; color: #10b981; }
+
+/* ── Google Maps Style Basemap & Layer Widget (Bottom-Left) ── */
+.gmaps-layer-widget {
+  position: absolute;
+  bottom: 24px;
+  left: 362px;
+  z-index: 950;
+  transition: left 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.drawer-left.collapsed ~ .gmaps-layer-widget {
+  left: 24px;
+}
+
+.gmaps-layer-btn {
+  background: var(--glass-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-default);
+  border-radius: 12px;
+  padding: 6px 12px 6px 8px;
+  box-shadow: var(--shadow-md);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  transition: all 0.18s ease;
+  user-select: none;
+}
+.gmaps-layer-btn:hover {
+  background: var(--bg-surface-elevated);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--border-active);
+  transform: translateY(-1px);
+}
+.gmaps-layer-thumb {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid var(--border-default);
+  background-size: cover;
+  background-position: center;
+  box-shadow: var(--shadow-sm);
+  flex-shrink: 0;
+}
+.gmaps-layer-text { display: flex; flex-direction: column; text-align: left; }
+.gmaps-layer-title { font-size: 12px; font-weight: 700; color: var(--text-main); }
+.gmaps-layer-sub { font-size: 10.5px; color: var(--text-muted); }
+
+/* Popup Tray */
+.gmaps-layer-tray {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  background: var(--glass-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border-default);
+  border-radius: 14px;
+  padding: 14px;
+  box-shadow: var(--shadow-lg);
+  display: none;
+  flex-direction: column;
+  gap: 12px;
+  width: 320px;
+  z-index: 960;
+}
+.gmaps-layer-widget.open .gmaps-layer-tray { display: flex; }
+
+.tray-section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); }
+.tray-cards-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.tray-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  text-align: center;
+}
+.tray-card-img {
+  width: 100%;
+  height: 52px;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-size: cover;
+  background-position: center;
+  transition: all 0.15s ease;
+  box-shadow: var(--shadow-sm);
+}
+.tray-card:hover .tray-card-img { transform: scale(1.04); }
+.tray-card.active .tray-card-img {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-wash);
+}
+.tray-card-name { font-size: 10.5px; font-weight: 600; color: var(--text-muted); }
+.tray-card.active .tray-card-name { color: var(--primary); font-weight: 700; }
+
+.tray-overlays-list { display: flex; flex-direction: column; gap: 7px; border-top: 1px solid var(--border-default); padding-top: 10px; }
+.tray-overlay-row { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--text-muted); cursor: pointer; }
+.tray-overlay-row input { accent-color: var(--primary); cursor: pointer; width: 14px; height: 14px; }
+.tray-swatch-badge { display: flex; align-items: center; gap: 7px; }
+.tray-swatch { width: 11px; height: 11px; border-radius: 3px; }
+
+/* ── Floating Report Panel (Right) ── */
+.drawer-right {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  bottom: 16px;
+  width: 370px;
+  max-width: calc(100vw - 32px);
+  background: var(--glass-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border-default);
+  border-radius: 14px;
+  box-shadow: var(--shadow-drawer);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s;
+}
+.drawer-right.hidden { transform: translateX(calc(100% + 20px)); opacity: 0; pointer-events: none; }
+
+.report-header {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border-default);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.report-title-box { display: flex; flex-direction: column; }
+.report-title { font-size: 15px; font-weight: 700; color: var(--text-main); }
+.report-badge {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--success);
+  font-weight: 600;
+  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.close-report-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.close-report-btn:hover { background: var(--bg-hover); color: var(--text-main); }
+
+.report-scroll { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 18px; }
+.report-scroll::-webkit-scrollbar { width: 5px; }
+.report-scroll::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 99px; }
+
+/* ── KPI Grid ── */
+.kpi-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.kpi-card {
+  background: var(--kpi-bg);
+  border: 1px solid var(--border-default);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+}
+.kpi-val { font-size: 20px; font-weight: 800; color: var(--text-main); font-family: var(--font-sans); letter-spacing: -0.03em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.kpi-unit { font-family: var(--font-mono); font-size: 9.5px; font-weight: 700; color: var(--primary); margin-top: 3px; letter-spacing: 0.04em; }
+.kpi-label { font-size: 11px; color: var(--text-muted); font-weight: 500; margin-top: 4px; }
+
+/* ── Data Tables ── */
+.metrics-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.metrics-table tr { border-bottom: 1px solid var(--border-subtle); }
+.metrics-table tr:last-child { border-bottom: none; }
+.metrics-table td { padding: 6px 0; }
+.metrics-table .col-label { color: var(--text-muted); font-weight: 500; }
+.metrics-table .col-label em { font-style: italic; color: var(--text-dim); margin-left: 4px; font-size: 11px; }
+.metrics-table .col-val { text-align: right; font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; color: var(--text-main); font-variant-numeric: tabular-nums; }
+
+/* ── Clean Outlet Details Card ── */
+.outlet-clean-card {
+  background: var(--kpi-bg);
+  border: 1px solid var(--border-default);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.outlet-clean-row { display: flex; align-items: center; justify-content: space-between; font-size: 12px; }
+.outlet-clean-label { color: var(--text-muted); font-weight: 500; }
+.outlet-clean-val { font-family: var(--font-mono); font-weight: 600; color: var(--text-main); }
+.snap-pill {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 99px;
+  background: var(--success-wash);
+  color: var(--success);
+}
+.snap-pill.far { background: var(--warning-wash); color: var(--warning); }
+
+/* Details/Accordion for Diagnostics */
+.dev-details {
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  font-size: 11.5px;
+  overflow: hidden;
+}
+.dev-details summary {
+  padding: 8px 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+  background: var(--bg-subtle);
+}
+.dev-details[open] summary { border-bottom: 1px solid var(--border-default); }
+.dev-details-body { padding: 10px 12px; }
+
+/* ── Warning Banner ── */
+.warn-banner {
+  background: var(--warning-wash);
+  border: 1px solid rgba(217, 119, 6, 0.3);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 11.5px;
+  color: var(--text-main);
+  line-height: 1.45;
+}
+.warn-banner strong { color: var(--warning); display: block; margin-bottom: 2px; }
+
+/* ── Permanent Delineation Status Card ── */
+.delineation-status-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  margin-bottom: 14px;
+  border: 1px solid transparent;
+}
+.delineation-status-card.status-success {
+  background: var(--success-wash);
+  border-color: rgba(5, 150, 105, 0.3);
+  color: var(--text-main);
+}
+.delineation-status-card.status-warn {
+  background: var(--warning-wash);
+  border-color: rgba(217, 119, 6, 0.35);
+  color: var(--text-main);
+}
+.status-card-icon {
+  margin-top: 1px;
+  flex-shrink: 0;
+}
+.delineation-status-card.status-success .status-card-icon { color: var(--success); }
+.delineation-status-card.status-warn .status-card-icon { color: var(--warning); }
+.status-card-content { flex: 1; }
+.status-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.status-card-desc {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  line-height: 1.35;
+}
+
+/* ── Mode Switching Tabs ── */
+.mode-tabs {
+  display: flex;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  padding: 3px;
+  margin-bottom: 14px;
+  gap: 4px;
+}
+.mode-tab {
+  flex: 1;
+  border: none;
+  background: transparent;
+  padding: 7px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all 0.15s;
+}
+.mode-tab:hover:not(.active) {
+  color: var(--text-main);
+  background: var(--bg-hover);
+}
+.mode-tab.active {
+  background: var(--bg-surface);
+  color: var(--primary);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+/* ── Batch Mode Elements ── */
+.dropzone {
+  border: 2px dashed var(--border-active);
+  border-radius: 10px;
+  padding: 22px 14px;
+  text-align: center;
+  cursor: pointer;
+  background: var(--bg-subtle);
+  transition: all 0.2s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.dropzone:hover, .dropzone.dragover {
+  border-color: var(--primary);
+  background: var(--primary-wash);
+}
+.dropzone-text {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+.dropzone-text strong {
+  color: var(--text-main);
+}
+.btn-text-link {
+  background: none;
+  border: none;
+  color: var(--primary);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
+}
+.btn-text-link:hover {
+  text-decoration: underline;
+}
+.batch-badge {
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--primary-wash);
+  color: var(--primary);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.batch-preview-box {
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  margin-top: 8px;
+}
+.batch-preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.batch-preview-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-subtle);
+  padding: 6px 8px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-default);
+}
+.batch-preview-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-main);
+}
+.batch-status-pill {
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+}
+.batch-status-pending { background: var(--bg-hover); color: var(--text-muted); }
+.batch-status-running { background: var(--primary-wash); color: var(--primary); }
+.batch-status-done { background: var(--success-wash); color: var(--success); }
+.batch-status-fail { background: var(--danger-wash); color: var(--danger); }
+.progress-track {
+  height: 6px;
+  background: var(--bg-hover);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--primary), #3b82f6);
+  transition: width 0.3s ease;
+  border-radius: 999px;
+}
+.btn-export-zip {
+  background: var(--success);
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-export-zip:hover:not(:disabled) {
+  background: var(--success-hover);
+  box-shadow: 0 4px 12px rgba(5, 150, 105, 0.3);
+}
+.btn-export-zip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── High-Contrast, Unclipped Toast Notification ── */
+.toast-bar {
+  position: absolute;
+  top: 22px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-10px);
+  z-index: 9999;
+  background: var(--bg-surface-elevated);
+  border: 1.5px solid var(--border-default);
+  border-radius: 12px;
+  padding: 12px 22px;
+  box-shadow: var(--shadow-lg);
+  font-size: 13px;
+  color: var(--text-main);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  opacity: 0;
+  pointer-events: none;
+  white-space: normal;
+  max-width: 620px;
+  text-align: center;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.toast-bar.visible { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
+.toast-bar.error { border-color: var(--danger); background: var(--danger-wash); }
+.toast-bar.warn { border-color: var(--warning); background: var(--warning-wash); }
+.toast-bar.success { border-color: var(--success); background: var(--success-wash); }
+.spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid var(--border-default);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Floating Map Pin Helper ── */
+.map-helper-chip {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.map-helper-chip strong { color: var(--primary); }
+
+/* Responsive adjustments */
+@media (max-width: 900px) {
+  .gmaps-layer-widget { left: 16px !important; bottom: 70px; }
+  .drawer-right { width: calc(100vw - 32px); max-height: 50vh; top: auto; bottom: 16px; }
+  .drawer-left { max-height: calc(50vh - 32px); }
+  .nav-links { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="app-shell">
+
+  <!-- Navbar Matching INCLINE -->
+  <header class="navbar">
+    <div class="nav-left">
+      <a href="https://incline.iitmandi.ac.in/" target="_blank" class="incline-logo" title="INCLINE - Indian Climate Information Explorer">
+        <div class="logo-badge">
+          <div class="logo-inner">IN</div>
+        </div>
+        <span class="logo-text">INCLINE</span>
+      </a>
+      <div class="module-badge">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>
+        <span>Watershed Delineation</span>
+      </div>
+      <nav class="nav-links">
+        <a href="https://incline.iitmandi.ac.in/" target="_blank" class="nav-item">Apps</a>
+        <a href="https://incline.iitmandi.ac.in/about" target="_blank" class="nav-item">About</a>
+        <a href="https://incline.iitmandi.ac.in/climate-feed" target="_blank" class="nav-item">ClimateFeed</a>
+      </nav>
+    </div>
+
+    <div class="nav-right">
+      <div class="engine-chip">
+        <span class="pulse-dot"></span>
+        <span id="engineStatusText">Engine Connecting…</span>
+      </div>
+      <button class="icon-btn" id="themeToggle" title="Toggle Light/Dark Theme">
+        <svg id="themeIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+      <button class="login-btn" onclick="window.open('https://incline.iitmandi.ac.in/', '_blank')">IIT Mandi</button>
+    </div>
+  </header>
+
+  <!-- Viewport: Full Map + Floating Panels -->
+  <main class="map-viewport">
+    <div id="map"></div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast-bar">
+      <span id="toastIcon"></span>
+      <span id="toastMsg">Ready</span>
+    </div>
+
+    <!-- Map Helper Pill -->
+    <div class="map-helper-chip">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      <span>Click any point on the map to place an outlet, then click <strong>Delineate Watershed</strong></span>
+    </div>
+
+    <!-- Collapsible Parameters Drawer (Left) -->
+    <aside class="drawer-left" id="leftDrawer">
+      <button class="drawer-toggle-btn" id="drawerToggle" title="Collapse / Expand Sidebar">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+
+      <div class="drawer-scroll">
+        <div class="drawer-header">
+          <h2 class="drawer-title">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--primary)" stroke-width="2.2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>
+            Watershed Delineation
+          </h2>
+          <p class="drawer-subtitle">Configure outlet coordinates &amp; extract hydrologic basin</p>
+        </div>
+
+        <!-- Mode Switcher Tabs (Single vs Batch) -->
+        <div class="mode-tabs">
+          <button class="mode-tab active" id="tabSingle" type="button">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>
+            <span>Single Outlet</span>
+          </button>
+          <button class="mode-tab" id="tabBatch" type="button">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+            <span>Batch CSV Upload</span>
+          </button>
+        </div>
+
+        <!-- Single Outlet Mode View -->
+        <div id="singleModeWrap">
+          <!-- Coordinates & Naming Input Card -->
+          <div class="form-section">
+            <div class="section-heading">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>
+              Outlet Coordinates &amp; Name
+            </div>
+            <div class="input-wrap" style="margin-bottom: 10px;">
+              <label class="input-label" for="inBasinName">Watershed Name / Code</label>
+              <input id="inBasinName" class="input-field" value="Basin_1" placeholder="e.g. Basin_1, Narmada_Upper">
+            </div>
+            <div class="coord-group">
+              <div class="input-wrap">
+                <label class="input-label" for="lat">Latitude (°N)</label>
+                <input id="lat" class="input-field" value="21.7051" inputmode="decimal" placeholder="e.g. 21.7051">
+              </div>
+              <div class="input-wrap">
+                <label class="input-label" for="lon">Longitude (°E)</label>
+                <input id="lon" class="input-field" value="72.9959" inputmode="decimal" placeholder="e.g. 72.9959">
+              </div>
+            </div>
+            <div class="hint-box" id="pointHint">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+              <span id="pointHintText">Narmada Outlet (21.7051, 72.9959)</span>
+            </div>
+
+            <button class="btn-primary" id="btnDelineate">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>
+              <span>Delineate Watershed</span>
+            </button>
+            <button class="btn-secondary" id="btnLocate">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/><circle cx="12" cy="12" r="7"/></svg>
+              <span>Use My Location</span>
+            </button>
+          </div>
+
+          <!-- Export Actions -->
+          <div class="form-section">
+            <div class="section-heading">Data Export</div>
+            <div class="export-grid">
+              <button class="btn-export" id="expGeoJSON" disabled>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                <span>GeoJSON</span>
+              </button>
+              <button class="btn-export" id="expKML" disabled>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/></svg>
+                <span>KML Layer</span>
+              </button>
+              <button class="btn-export" id="expRivers" disabled>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12c3-4 6-4 9 0s6 4 9 0"/></svg>
+                <span>Streams</span>
+              </button>
+              <button class="btn-export" id="expReportCsv" disabled style="background: var(--primary-wash); border-color: var(--primary); color: var(--primary);">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>
+                <span>Report CSV</span>
+              </button>
+              <button class="btn-export" id="expReport" disabled style="grid-column: span 2;">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 8h10M7 12h10M7 16h6"/></svg>
+                <span>Report JSON</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Batch CSV Upload Mode View -->
+        <div id="batchModeWrap" style="display: none;">
+          <div class="form-section">
+            <div class="section-heading">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+              Upload Outlets CSV
+            </div>
+
+            <!-- Drag & Drop Zone -->
+            <div class="dropzone" id="batchDropzone">
+              <input type="file" id="batchFileInput" accept=".csv,text/csv,text/plain" style="display: none;">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="var(--primary)" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              <div class="dropzone-text">
+                <strong>Click to browse</strong> or drag &amp; drop CSV here<br>
+                <span style="font-size: 11px; color: var(--text-dim);">Headers: <code>basin_name, lat, lon</code></span>
+              </div>
+            </div>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px;">
+              <button class="btn-text-link" id="btnSampleCsv" type="button" title="Download official CWC station outlets recorded on ffs.india-water.gov.in">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                Download CWC Verified Sample CSV
+              </button>
+              <span id="batchCountBadge" class="batch-badge" style="display: none;">0 Outlets</span>
+            </div>
+
+            <!-- Batch Outlets Table -->
+            <div id="batchPreviewBox" class="batch-preview-box" style="display: none;">
+              <table class="batch-preview-table">
+                <thead>
+                  <tr>
+                    <th>Basin Name</th>
+                    <th>Lat</th>
+                    <th>Lon</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="batchPreviewTbody"></tbody>
+              </table>
+            </div>
+
+            <button class="btn-primary" id="btnBatchDelineate" disabled style="margin-top: 12px;">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              <span>Delineate All Watersheds</span>
+            </button>
+
+            <!-- Progress Bar -->
+            <div id="batchProgressWrap" style="display: none; margin-top: 10px;">
+              <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">
+                <span id="batchProgressLabel">Delineating...</span>
+                <span id="batchProgressPercent">0%</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-fill" id="batchProgressBar" style="width: 0%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Batch ZIP Export Card -->
+          <div class="form-section">
+            <div class="section-heading">Batch Download</div>
+            <button class="btn-export-zip" id="btnBatchZip" disabled style="width: 100%;">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span>Download All as ZIP (.zip)</span>
+            </button>
+            <div style="font-size: 11px; color: var(--text-dim); margin-top: 6px; line-height: 1.4;">
+              Packages individual &amp; combined GeoJSONs, stream networks, and a morphometrics comparative summary CSV.
+            </div>
+          </div>
+        </div>
+
+        <!-- Automated Backend Snapping Badge -->
+        <div class="auto-engine-badge">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          <div>
+            <strong>Automated Snapping Active</strong><br>
+            Smart multi-radius ladder &amp; weight-first trunk resolution handled automatically.
+          </div>
+        </div>
+
+        <div style="font-size: 11px; color: var(--text-dim); line-height: 1.5; border-top: 1px solid var(--border-default); padding-top: 12px;">
+          Engine: <strong>pourpoint 0.3.0</strong> (High-Performance Rust Core)<br>
+          Fabric: <strong>GRIT 2.0.0</strong> · Planetary HFX Mirror
+        </div>
+      </div>
+    </aside>
+
+    <!-- Google Maps Style Floating Basemap & Overlays Widget (Bottom-Left) -->
+    <div class="gmaps-layer-widget" id="gmapsWidget">
+      <!-- Expanded Tray -->
+      <div class="gmaps-layer-tray" id="gmapsTray">
+        <div class="tray-section-title">Basemap</div>
+        <div class="tray-cards-grid">
+          <div class="tray-card active" data-basemap="topo" id="bmTopo">
+            <div class="tray-card-img" style="background: linear-gradient(135deg, #dcfce7, #bae6fd);"></div>
+            <span class="tray-card-name">Default</span>
+          </div>
+          <div class="tray-card" data-basemap="sat" id="bmSat">
+            <div class="tray-card-img" style="background: linear-gradient(135deg, #064e3b, #0f172a);"></div>
+            <span class="tray-card-name">Satellite</span>
+          </div>
+          <div class="tray-card" data-basemap="relief" id="bmRelief">
+            <div class="tray-card-img" style="background: linear-gradient(135deg, #fed7aa, #cbd5e1);"></div>
+            <span class="tray-card-name">Terrain</span>
+          </div>
+          <div class="tray-card" data-basemap="dark" id="bmDark">
+            <div class="tray-card-img" style="background: linear-gradient(135deg, #1e293b, #020617);"></div>
+            <span class="tray-card-name">Dark</span>
+          </div>
+        </div>
+
+        <div class="tray-section-title" style="margin-top: 2px;">Map Features</div>
+        <div class="tray-overlays-list">
+          <label class="tray-overlay-row">
+            <span class="tray-swatch-badge">
+              <span class="tray-swatch" style="background: #2563eb;"></span>
+              <span>Watershed Boundary</span>
+            </span>
+            <input type="checkbox" id="layerBasin" checked>
+          </label>
+          <label class="tray-overlay-row">
+            <span class="tray-swatch-badge">
+              <span class="tray-swatch" style="background: #0284c7;"></span>
+              <span>Stream Network</span>
+            </span>
+            <input type="checkbox" id="layerRivers" checked>
+          </label>
+          <label class="tray-overlay-row">
+            <span class="tray-swatch-badge">
+              <span class="tray-swatch" style="background: #d97706;"></span>
+              <span>Outlet Markers</span>
+            </span>
+            <input type="checkbox" id="layerOutlets" checked>
+          </label>
+        </div>
+      </div>
+
+      <!-- Trigger Button -->
+      <div class="gmaps-layer-btn" id="gmapsToggleBtn" title="Change Basemap & Layers">
+        <div class="gmaps-layer-thumb" id="gmapsCurrentThumb" style="background: linear-gradient(135deg, #dcfce7, #bae6fd);"></div>
+        <div class="gmaps-layer-text">
+          <span class="gmaps-layer-title" id="gmapsCurrentName">Layers</span>
+          <span class="gmaps-layer-sub">Map style</span>
+        </div>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+      </div>
+    </div>
+
+    <!-- Floating Morphometrics Report Drawer (Right) -->
+    <section class="drawer-right hidden" id="rightDrawer">
+      <div class="report-header">
+        <div class="report-title-box">
+          <div class="report-title">Morphometric Profile</div>
+          <div class="report-badge" id="reportSpeedBadge">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            <span id="reportPerfText">Delineated in 0.5s</span>
+          </div>
+        </div>
+        <button class="close-report-btn" id="btnCloseReport" title="Close Report">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      <div class="report-scroll" id="reportScrollContent">
+        <!-- Rendered dynamically -->
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const num = (v, d = 2) => v == null ? "—" : Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+
+let CURRENT_DATA = null;
+let isBusy = false;
+let toastTimeout = null;
+
+/* ── Theme Management ── */
+const themeToggle = $("themeToggle");
+const themeIcon = $("themeIcon");
+
+function setTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  localStorage.setItem("incline_theme", theme);
+  if (theme === "dark") {
+    themeIcon.innerHTML = `<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>`;
+  } else {
+    themeIcon.innerHTML = `<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>`;
+  }
+}
+const savedTheme = localStorage.getItem("incline_theme") || "light";
+setTheme(savedTheme);
+themeToggle.addEventListener("click", () => {
+  const current = document.documentElement.getAttribute("data-theme");
+  setTheme(current === "dark" ? "light" : "dark");
+});
+
+/* ── Map Setup ── */
+const map = L.map("map", { zoomControl: false, worldCopyJump: true }).setView([22.0, 79.5], 5);
+L.control.zoom({ position: "topright" }).addTo(map);
+L.control.scale({ imperial: false, position: "bottomright" }).addTo(map);
+
+// Fit India bounds on load
+map.fitBounds([[7.5, 68.0], [35.5, 97.5]]);
+
+const ESRI = n => `https://server.arcgisonline.com/ArcGIS/rest/services/${n}/MapServer/tile/{z}/{y}/{x}`;
+const BASEMAPS = {
+  topo: {
+    layer: L.tileLayer(ESRI("World_Topo_Map"), { maxZoom: 19, attribution: "Esri, USGS, NOAA" }),
+    name: "Default",
+    bg: "linear-gradient(135deg, #dcfce7, #bae6fd)"
+  },
+  sat: {
+    layer: L.tileLayer(ESRI("World_Imagery"), { maxZoom: 19, attribution: "Esri, Maxar" }),
+    name: "Satellite",
+    bg: "linear-gradient(135deg, #064e3b, #0f172a)"
+  },
+  relief: {
+    layer: L.tileLayer(ESRI("World_Shaded_Relief"), { maxZoom: 13, attribution: "Esri" }),
+    name: "Terrain",
+    bg: "linear-gradient(135deg, #fed7aa, #cbd5e1)"
+  },
+  dark: {
+    layer: L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { maxZoom: 19, attribution: "&copy; CARTO" }),
+    name: "Dark",
+    bg: "linear-gradient(135deg, #1e293b, #020617)"
+  },
+};
+let currentBasemapKey = "topo";
+let activeBasemapLayer = BASEMAPS.topo.layer.addTo(map);
+
+/* ── Google Maps Basemap Switcher Logic ── */
+const gmapsWidget = $("gmapsWidget");
+const gmapsToggleBtn = $("gmapsToggleBtn");
+const gmapsTray = $("gmapsTray");
+
+gmapsToggleBtn.addEventListener("click", e => {
+  e.stopPropagation();
+  gmapsWidget.classList.toggle("open");
+});
+
+document.addEventListener("click", e => {
+  if (!gmapsWidget.contains(e.target)) {
+    gmapsWidget.classList.remove("open");
+  }
+});
+
+document.querySelectorAll(".tray-card").forEach(card => {
+  card.addEventListener("click", () => {
+    const key = card.dataset.basemap;
+    if (key === currentBasemapKey) return;
+
+    document.querySelectorAll(".tray-card").forEach(c => c.classList.remove("active"));
+    card.classList.add("active");
+
+    map.removeLayer(activeBasemapLayer);
+    activeBasemapLayer = BASEMAPS[key].layer.addTo(map);
+    activeBasemapLayer.bringToBack();
+
+    currentBasemapKey = key;
+    $("gmapsCurrentName").textContent = BASEMAPS[key].name;
+    $("gmapsCurrentThumb").style.background = BASEMAPS[key].bg;
+    gmapsWidget.classList.remove("open");
+  });
+});
+
+/* ── Map Feature Layers ── */
+const gBasin = L.layerGroup().addTo(map);
+const gRivers = L.layerGroup().addTo(map);
+const gOutlets = L.layerGroup().addTo(map);
+const gPin = L.layerGroup().addTo(map);
+
+$("layerBasin").addEventListener("change", e => e.target.checked ? gBasin.addTo(map) : map.removeLayer(gBasin));
+$("layerRivers").addEventListener("change", e => e.target.checked ? gRivers.addTo(map) : map.removeLayer(gRivers));
+$("layerOutlets").addEventListener("change", e => e.target.checked ? gOutlets.addTo(map) : map.removeLayer(gOutlets));
+
+/* ── Sidebar Drawers ── */
+const leftDrawer = $("leftDrawer");
+$("drawerToggle").addEventListener("click", () => {
+  leftDrawer.classList.toggle("collapsed");
+});
+
+const rightDrawer = $("rightDrawer");
+$("btnCloseReport").addEventListener("click", () => {
+  rightDrawer.classList.add("hidden");
+});
+
+/* ── Pin & Location Handling ── */
+function updatePin(lat, lon) {
+  gPin.clearLayers();
+  L.circleMarker([lat, lon], {
+    radius: 7,
+    color: "#2563eb",
+    weight: 3,
+    fillColor: "#ffffff",
+    fillOpacity: 1
+  }).bindTooltip("Selected Outlet Point").addTo(gPin);
+  $("pointHintText").textContent = `Selected: ${lat.toFixed(4)}°N, ${lon.toFixed(4)}°E`;
+}
+
+map.on("click", e => {
+  if (isBusy) return;
+  const lat = e.latlng.lat;
+  const lon = e.latlng.wrap().lng;
+  $("lat").value = lat.toFixed(4);
+  $("lon").value = lon.toFixed(4);
+  updatePin(lat, lon);
+});
+
+["lat", "lon"].forEach(id => $(id).addEventListener("change", () => {
+  const la = parseFloat($("lat").value);
+  const lo = parseFloat($("lon").value);
+  if (isFinite(la) && isFinite(lo)) updatePin(la, lo);
+}));
+
+$("btnLocate").addEventListener("click", () => {
+  if (!navigator.geolocation) return showToast("Geolocation unavailable", "error");
+  showToast("Locating your position…", "info", true);
+  navigator.geolocation.getCurrentPosition(
+    p => {
+      const la = p.coords.latitude;
+      const lo = p.coords.longitude;
+      $("lat").value = la.toFixed(4);
+      $("lon").value = lo.toFixed(4);
+      map.setView([la, lo], 10);
+      updatePin(la, lo);
+      showToast("Location captured — press Delineate", "success");
+    },
+    () => showToast("Location permission denied", "error")
+  );
+});
+
+/* ── Toast Notifications ── */
+function showToast(msg, kind = "info", spin = false) {
+  const t = $("toast");
+  const icon = $("toastIcon");
+  const msgEl = $("toastMsg");
+  icon.innerHTML = spin ? `<div class="spinner"></div>` : "";
+  msgEl.innerHTML = msg;
+  t.className = `toast-bar visible ${kind}`;
+  clearTimeout(toastTimeout);
+  if (!spin) {
+    toastTimeout = setTimeout(() => t.classList.remove("visible"), kind === "error" ? 8000 : 4500);
+  }
+}
+
+/* ── Engine Status Probe ── */
+fetch("/api/meta").then(r => r.json()).then(m => {
+  $("engineStatusText").textContent = `Local GRIT 2.0.0 ready (${m.open_seconds.toFixed(0)}s init)`;
+}).catch(() => {
+  $("engineStatusText").textContent = "Engine Offline";
+});
+
+/* ── Delineation Trigger (Clean Automatic Backend Parameters) ── */
+$("btnDelineate").addEventListener("click", runDelineation);
+
+async function runDelineation() {
+  if (isBusy) return;
+  const lat = $("lat").value.trim();
+  const lon = $("lon").value.trim();
+  if (!lat || !lon) return showToast("Please provide valid coordinates", "error");
+
+  isBusy = true;
+  $("btnDelineate").disabled = true;
+  $("btnDelineate").querySelector("span").textContent = "Delineating…";
+  showToast("Delineating watershed… streaming local GRIT hydrofabric", "info", true);
+
+  try {
+    // Note: Backend automatically uses WeightFirst and multi-step ladder (1 -> 5 -> 20 -> 50 km)
+    const params = { lat, lon };
+
+    const t0 = performance.now();
+    const res = await fetch("/api/delineate?" + new URLSearchParams(params));
+    const data = await res.json();
+    const durationMs = Math.round(performance.now() - t0);
+
+    if (!data.ok) {
+      gBasin.clearLayers();
+      gRivers.clearLayers();
+      gOutlets.clearLayers();
+      L.circleMarker([+lat, +lon], { radius: 6, color: "#dc2626", fillColor: "#dc2626", fillOpacity: 0.8 }).addTo(gOutlets);
+      showToast(`<strong>Resolution Failed:</strong> ${data.error}`, "error");
+      return;
+    }
+
+    CURRENT_DATA = data;
+    renderResults(data, durationMs);
+    rightDrawer.classList.remove("hidden");
+
+    const km = (data.radius_used_m / 1000).toFixed(0);
+    if (data.escalated) {
+      showToast(`<strong>Delineated: ${num(data.area_km2)} km²</strong> (${durationMs} ms) — Snapped to ${km} km flowline`, "warn");
+    } else {
+      showToast(`<strong>Delineated: ${num(data.area_km2)} km²</strong> in ${durationMs} ms`, "success");
+    }
+  } catch (err) {
+    showToast("Network / Server Error: " + err.message, "error");
+  } finally {
+    isBusy = false;
+    $("btnDelineate").disabled = false;
+    $("btnDelineate").querySelector("span").textContent = "Delineate Watershed";
+  }
+}
+
+/* ── Render Geometries ── */
+function renderResults(d, ms) {
+  gBasin.clearLayers();
+  gRivers.clearLayers();
+  gOutlets.clearLayers();
+  gPin.clearLayers();
+
+  // Watershed boundary polygon
+  const basinLayer = L.geoJSON(d.geometry.watershed, {
+    style: {
+      color: "#2563eb",
+      weight: 2.5,
+      opacity: 0.95,
+      fillColor: "#3b82f6",
+      fillOpacity: 0.18
+    }
+  }).addTo(gBasin);
+
+  // River network linework
+  L.geoJSON(d.geometry.reaches, {
+    style: f => ({
+      color: f.properties.stem_role === "mainstem" ? "#0284c7" : "#38bdf8",
+      weight: f.properties.stem_role === "mainstem" ? 2.3 : 1.4,
+      opacity: 0.92
+    }),
+    onEachFeature: (f, l) => {
+      l.bindTooltip(`Unit: ${f.properties.unit_id} · ${f.properties.stem_role || "reach"} · ${f.properties.length_km.toFixed(2)} km`);
+    }
+  }).addTo(gRivers);
+
+  // Requested outlet marker
+  L.circleMarker([d.input.lat, d.input.lon], {
+    radius: 5,
+    color: "#d97706",
+    weight: 2,
+    fillColor: "#ffffff",
+    fillOpacity: 1
+  }).bindTooltip("Requested Input Point").addTo(gOutlets);
+
+  // Snapped outlet marker
+  L.circleMarker([d.resolved.lat, d.resolved.lon], {
+    radius: 7,
+    color: "#2563eb",
+    weight: 2.5,
+    fillColor: "#2563eb",
+    fillOpacity: 0.9
+  }).bindTooltip("Snapped River Outlet").addTo(gOutlets);
+
+  try {
+    map.fitBounds(basinLayer.getBounds(), { padding: [40, 40] });
+  } catch (e) {}
+
+  // Enable Export Buttons
+  ["expGeoJSON", "expKML", "expRivers", "expReportCsv", "expReport"].forEach(id => {
+    const el = $(id);
+    if (el) el.disabled = false;
+  });
+
+  // Populate Report
+  buildReportDOM(d, ms);
+}
+
+/* ── Build Clean Report DOM ── */
+function buildReportDOM(d, totalMs) {
+  const g = re => { const m = d.resolution.match(re); return m ? m[1] : null; };
+  const dist = g(/distance_m:\s*([\d.]+)/);
+  const wt = g(/weight:\s*Weight\(([\d.]+)\)/);
+  const cand = g(/candidates_considered:\s*(\d+)/);
+  const strat = g(/strategy:\s*(\w+)/);
+
+  const computeMs = ((d.timing.delineate_s + d.timing.reaches_s) * 1000).toFixed(0);
+  $("reportPerfText").textContent = `Compute: ${computeMs} ms · Total: ${totalMs} ms`;
+
+  const makeTable = rows => `
+    <table class="metrics-table">
+      ${rows.map(([k, sym, v]) => `
+        <tr>
+          <td class="col-label">${k} ${sym ? `<em>${sym}</em>` : ""}</td>
+          <td class="col-val">${v}</td>
+        </tr>
+      `).join("")}
+    </table>
+  `;
+
+  const distM = dist ? +dist : 0;
+  const isFar = distM > 1000;
+  const basinName = getBasinName(d);
+
+  const getTextureClass = t => {
+    if (t < 2) return "Very Coarse";
+    if (t <= 4) return "Coarse";
+    if (t <= 6) return "Moderate";
+    if (t <= 8) return "Fine";
+    return "Very Fine";
+  };
+
+  $("reportScrollContent").innerHTML = `
+    <!-- Permanent Delineation Status Card -->
+    <div class="delineation-status-card ${d.escalated ? 'status-warn' : 'status-success'}">
+      <div class="status-card-icon">
+        ${d.escalated ?
+          `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>` :
+          `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`
+        }
+      </div>
+      <div class="status-card-content">
+        <div class="status-card-title">
+          Delineated: <strong>${num(d.area_km2)} km²</strong> (${totalMs} ms)
+        </div>
+        <div class="status-card-desc">
+          ${d.escalated ? `Snapped to ${(d.radius_used_m / 1000).toFixed(0)} km flowline (distance: ${num(+dist, 1)} m)` : 'Snapped directly to on-channel flowline'}
+        </div>
+      </div>
+    </div>
+
+    <div class="kpi-cards">
+      <div class="kpi-card">
+        <span class="kpi-val">${num(d.area_km2, 1)}</span>
+        <span class="kpi-unit">KM²</span>
+        <span class="kpi-label">Drainage Area</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-val">${num(d.perimeter_km, 1)}</span>
+        <span class="kpi-unit">KM</span>
+        <span class="kpi-label">Basin Perimeter</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-val">${num(d.drainage_density, 3)}</span>
+        <span class="kpi-unit">KM / KM²</span>
+        <span class="kpi-label">Drainage Density</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-val">Order ${d.max_strahler_order}</span>
+        <span class="kpi-unit">STRAHLER</span>
+        <span class="kpi-label">Max Stream Order</span>
+      </div>
+    </div>
+
+    <!-- Outlet & Snapping Resolution (User-Focused) -->
+    <div class="form-section">
+      <div class="section-heading">Outlet &amp; Resolution</div>
+      <div class="outlet-clean-card">
+        <div class="outlet-clean-row">
+          <span class="outlet-clean-label">Watershed Identifier</span>
+          <span class="outlet-clean-val" style="font-weight: 600; color: var(--primary);">${basinName}</span>
+        </div>
+        <div class="outlet-clean-row">
+          <span class="outlet-clean-label">Resolved Stream Outlet</span>
+          <span class="outlet-clean-val">${d.resolved.lat.toFixed(4)}°N, ${d.resolved.lon.toFixed(4)}°E</span>
+        </div>
+        <div class="outlet-clean-row">
+          <span class="outlet-clean-label">Snap Distance</span>
+          <span class="snap-pill ${isFar ? 'far' : ''}">${dist ? `${num(distM, 1)} m` : 'On Stream'}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Planform & Shape Indices -->
+    <div class="form-section">
+      <div class="section-heading">Planform &amp; Shape Indices</div>
+      ${makeTable([
+        ["Basin Length", "L<sub>b</sub>", `${num(d.basin_length_km)} km`],
+        ["Gravelius Compactness", "K<sub>c</sub>", num(d.gravelius_kc, 4)],
+        ["Circularity Ratio", "R<sub>c</sub>", num(d.circularity_rc, 4)],
+        ["Form Factor", "R<sub>f</sub>", num(d.form_factor_rf, 4)],
+        ["Elongation Ratio", "R<sub>e</sub>", num(d.elongation_re, 4)]
+      ])}
+    </div>
+
+    <!-- Stream Network Topology -->
+    <div class="form-section">
+      <div class="section-heading">Stream Network Topology</div>
+      ${makeTable([
+        ["Total Channel Length", "ΣL", `${num(d.channel_length_km)} km`],
+        ["Mainstem Length", "L<sub>m</sub>", `${num(d.mainstem_length_km)} km`],
+        ["Stream Frequency", "F<sub>s</sub>", `${num(d.stream_frequency, 4)} /km²`],
+        ["Channel Maintenance", "C", `${num(d.channel_maintenance, 3)} km²/km`],
+        ["Length of Overland Flow", "L<sub>g</sub>", `${num(d.overland_flow_km, 3)} km`],
+        ["Drainage Texture (Smith)", "R<sub>t</sub>", `${num(d.texture_ratio, 3)} /km <span style="font-size:10px;color:var(--text-muted);">(${getTextureClass(d.texture_ratio)})</span>`],
+        ["Drainage Catchment Units", "", String(d.units)],
+        ["Channel Network Reaches", "", String(d.reaches)],
+        ["Stream Order Distribution", "1→" + d.max_strahler_order, d.order_counts.join(" / ")],
+        ["Channel Roles", "M / T / D", `${d.roles.mainstem} / ${d.roles.tributary} / ${d.roles.distributary}`]
+      ])}
+    </div>
+
+    <!-- Engine Diagnostics & Timing (Collapsible) -->
+    <details class="dev-details">
+      <summary>Engine Performance Details</summary>
+      <div class="dev-details-body">
+        ${makeTable([
+          ["Terminal Catchment ID", "", `#${d.terminal_unit_id}`],
+          ["Fetch Units Time", "", `${(d.timing.fetch_units_s * 1000).toFixed(0)} ms`],
+          ["Dissolve Time", "", `${(d.timing.dissolve_s * 1000).toFixed(0)} ms`],
+          ["Reaches Query Time", "", `${(d.timing.reaches_s * 1000).toFixed(0)} ms`],
+          ["Traverse Time", "", `${(d.timing.traverse_s * 1000).toFixed(0)} ms`],
+          ["Candidate Channels", "", cand || "—"],
+          ["Snap Strategy", "", strat || "WeightFirst"]
+        ])}
+      </div>
+    </details>
+  `;
+}
+
+/* ── Custom Basin Naming ── */
+function getBasinName(d) {
+  const userVal = $("inBasinName") ? $("inBasinName").value.trim() : "";
+  if (userVal) return userVal.replace(/[^a-zA-Z0-9_\-]/g, "_");
+  if (d && d.resolved) return `Basin_${d.resolved.lat.toFixed(4)}_${d.resolved.lon.toFixed(4)}`.replace(/\./g, "_");
+  return "Watershed_1";
+}
+
+/* ── Morphometrics Scientific CSV Generator ── */
+function generateMorphometricsCsv(d, basinName) {
+  const name = basinName || getBasinName(d);
+  const dist = d.resolution ? ((d.resolution.match(/dist_m:\s*([\d.]+)/) || [])[1] || "0") : "0";
+  const numVal = (v, dec = 4) => (v !== undefined && v !== null && !isNaN(v)) ? Number(v).toFixed(dec) : "";
+
+  const rows = [
+    ["Parameter", "Symbol", "Value", "Unit", "Scientific Reference / Method"],
+    ["Watershed Identifier", "ID", name, "", "User Specified"],
+    ["Resolved Outlet Latitude", "Lat", numVal(d.resolved.lat, 6), "°N", "WGS84 Ellipsoidal Coordinates"],
+    ["Resolved Outlet Longitude", "Lon", numVal(d.resolved.lon, 6), "°E", "WGS84 Ellipsoidal Coordinates"],
+    ["Stream Snap Distance", "dist", numVal(+dist, 1), "m", "WeightFirst Multi-Radius Snapping"],
+    ["Drainage Basin Area", "A", numVal(d.area_km2, 2), "km²", "Horton (1932); WGS84 Geodesic Polygon"],
+    ["Basin Perimeter", "P", numVal(d.perimeter_km, 2), "km", "Karney Geodesic Boundary (1945)"],
+    ["Basin Length", "Lb", numVal(d.basin_length_km, 2), "km", "Schumm (1956); Max Outlet-to-Divide Distance"],
+    ["Gravelius Compactness Coefficient", "Kc", numVal(d.gravelius_kc, 4), "dimensionless", "Gravelius (1914); Kc = P / (2 * sqrt(pi * A))"],
+    ["Miller Circularity Ratio", "Rc", numVal(d.circularity_rc, 4), "dimensionless", "Miller (1953); Rc = 4 * pi * A / P²"],
+    ["Horton Form Factor", "Rf", numVal(d.form_factor_rf, 4), "dimensionless", "Horton (1932); Rf = A / Lb²"],
+    ["Schumm Elongation Ratio", "Re", numVal(d.elongation_re, 4), "dimensionless", "Schumm (1956); Re = (2 / Lb) * sqrt(A / pi)"],
+    ["Total Channel Network Length", "ΣL", numVal(d.channel_length_km, 2), "km", "Horton (1945); Hydrofabric Geodesic Length"],
+    ["Mainstem Channel Length", "Lm", numVal(d.mainstem_length_km, 2), "km", "GRIT 2.0 Mainstem Flowline"],
+    ["Horton Drainage Density", "Dd", numVal(d.drainage_density, 4), "km/km²", "Horton (1932; 1945); Dd = ΣL / A"],
+    ["Stream Frequency", "Fs", numVal(d.stream_frequency, 4), "1/km²", "Horton (1945); Fs = N / A"],
+    ["Constant of Channel Maintenance", "C", numVal(d.channel_maintenance, 4), "km²/km", "Schumm (1956); C = 1 / Dd = A / ΣL"],
+    ["Length of Overland Flow", "Lg", numVal(d.overland_flow_km, 4), "km", "Horton (1945); Lg = 1 / (2 * Dd) = A / (2 * ΣL)"],
+    ["Drainage Texture Ratio (Smith)", "Rt", numVal(d.texture_ratio, 4), "1/km", "Smith (1950); Rt = N1 / P"],
+    ["Maximum Strahler Stream Order", "u", String(d.max_strahler_order), "Order", "Strahler (1952; 1957)"],
+    ["Drainage Catchment Units", "", String(d.units), "count", "GRIT 2.0 Global Hydrofabric Units"],
+    ["Total Network Reaches", "N", String(d.reaches), "count", "GRIT 2.0 River Reach Segments"],
+    ["Mainstem Reaches", "M", String(d.roles.mainstem), "count", "StemRole::Mainstem"],
+    ["Tributary Reaches", "T", String(d.roles.tributary), "count", "StemRole::Tributary"],
+    ["Distributary Reaches", "D", String(d.roles.distributary), "count", "StemRole::Distributary"],
+    ["Delineation Engine Compute Time", "", numVal(d.timing.delineate_s * 1000, 0), "ms", "pourpoint-core Rust Engine"],
+    ["Channel Reaches Query Time", "", numVal(d.timing.reaches_s * 1000, 0), "ms", "Spatial Index Traversal"],
+    ["Hydrofabric Catchments Fetch Time", "", numVal(d.timing.fetch_units_s * 1000, 0), "ms", "Parquet Row-Group Streaming"],
+    ["Watershed Polygon Dissolve Time", "", numVal(d.timing.dissolve_s * 1000, 0), "ms", "WKB Union / PostGIS Topology"]
+  ];
+
+  return rows.map(r => r.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(",")).join("\r\n");
+}
+
+/* ── Export Downloads ── */
+function triggerDownload(name, content, mime) {
+  const blob = content instanceof Blob ? content : new Blob([content], { type: mime });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+// 1. Report CSV
+$("expReportCsv").addEventListener("click", () => {
+  if (!CURRENT_DATA) return;
+  const name = getBasinName(CURRENT_DATA);
+  const csv = generateMorphometricsCsv(CURRENT_DATA, name);
+  triggerDownload(`${name}_morphometrics.csv`, csv, "text/csv;charset=utf-8;");
+});
+
+// 2. GeoJSON
+$("expGeoJSON").addEventListener("click", () => {
+  if (!CURRENT_DATA) return;
+  const name = getBasinName(CURRENT_DATA);
+  triggerDownload(`${name}_boundary.geojson`, JSON.stringify({
+    type: "Feature",
+    properties: {
+      watershed_name: name,
+      area_km2: CURRENT_DATA.area_km2,
+      perimeter_km: CURRENT_DATA.perimeter_km,
+      basin_length_km: CURRENT_DATA.basin_length_km,
+      gravelius_kc: CURRENT_DATA.gravelius_kc,
+      circularity_rc: CURRENT_DATA.circularity_rc,
+      form_factor_rf: CURRENT_DATA.form_factor_rf,
+      elongation_re: CURRENT_DATA.elongation_re,
+      drainage_density: CURRENT_DATA.drainage_density,
+      stream_frequency: CURRENT_DATA.stream_frequency,
+      channel_maintenance: CURRENT_DATA.channel_maintenance,
+      overland_flow_km: CURRENT_DATA.overland_flow_km,
+      texture_ratio: CURRENT_DATA.texture_ratio,
+      max_strahler_order: CURRENT_DATA.max_strahler_order,
+      terminal_unit_id: CURRENT_DATA.terminal_unit_id
+    },
+    geometry: CURRENT_DATA.geometry.watershed
+  }, null, 2), "application/geo+json");
+});
+
+// 3. Streams
+$("expRivers").addEventListener("click", () => {
+  if (!CURRENT_DATA) return;
+  const name = getBasinName(CURRENT_DATA);
+  triggerDownload(`${name}_streams.geojson`, JSON.stringify(CURRENT_DATA.geometry.reaches, null, 2), "application/geo+json");
+});
+
+// 4. Report JSON
+$("expReport").addEventListener("click", () => {
+  if (!CURRENT_DATA) return;
+  const name = getBasinName(CURRENT_DATA);
+  const { geometry, ...rest } = CURRENT_DATA;
+  rest.watershed_name = name;
+  triggerDownload(`${name}_report.json`, JSON.stringify(rest, null, 2), "application/json");
+});
+
+// 5. KML Layer
+$("expKML").addEventListener("click", () => {
+  if (!CURRENT_DATA) return;
+  const name = getBasinName(CURRENT_DATA);
+  const polys = CURRENT_DATA.geometry.watershed.coordinates.map(poly =>
+    "<Polygon>" + poly.map((ring, i) => {
+      const cs = ring.map(([x, y]) => `${x},${y},0`).join(" ");
+      return i === 0 ? `<outerBoundaryIs><LinearRing><coordinates>${cs}</coordinates></LinearRing></outerBoundaryIs>`
+                     : `<innerBoundaryIs><LinearRing><coordinates>${cs}</coordinates></LinearRing></innerBoundaryIs>`;
+    }).join("") + "</Polygon>"
+  ).join("");
+
+  const kml = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>${name} (${CURRENT_DATA.area_km2.toFixed(1)} km2)</name>
+  <Placemark>
+    <name>${name}</name>
+    <MultiGeometry>${polys}</MultiGeometry>
+  </Placemark>
+</Document>
+</kml>`;
+  triggerDownload(`${name}_boundary.kml`, kml, "application/vnd.google-earth.kml+xml");
+});
+
+/* ── Mode Switching Logic (Single vs Batch) ── */
+function switchMode(mode) {
+  if (mode === "single") {
+    $("tabSingle").classList.add("active");
+    $("tabBatch").classList.remove("active");
+    $("singleModeWrap").style.display = "block";
+    $("batchModeWrap").style.display = "none";
+  } else {
+    $("tabBatch").classList.add("active");
+    $("tabSingle").classList.remove("active");
+    $("singleModeWrap").style.display = "none";
+    $("batchModeWrap").style.display = "block";
+  }
+}
+$("tabSingle").addEventListener("click", () => switchMode("single"));
+$("tabBatch").addEventListener("click", () => switchMode("batch"));
+
+/* ── Batch CSV Upload & Delineation ── */
+let BATCH_OUTLETS = [];
+let BATCH_RESULTS = [];
+const gBatchBasins = L.layerGroup().addTo(map);
+const gBatchRivers = L.layerGroup().addTo(map);
+const gBatchMarkers = L.layerGroup().addTo(map);
+
+const BATCH_COLORS = [
+  "#2563eb", "#059669", "#d97706", "#7c3aed",
+  "#db2777", "#0891b2", "#ea580c", "#4f46e5",
+  "#16a34a", "#ca8a04", "#9333ea", "#0284c7"
+];
+
+// Sample CSV Download (Verified CWC Flood Forecasting Stations from ffs.india-water.gov.in)
+$("btnSampleCsv").addEventListener("click", () => {
+  const sample = "basin_name,latitude,longitude,river,basin\r\n" +
+    "CWC_Mandla,22.5980,80.3700,Narmada,Narmada\r\n" +
+    "CWC_Delhi_Railway_Bridge,28.6620,77.2470,Yamuna,Ganga\r\n" +
+    "CWC_Lucknow,26.8500,80.9500,Gomti,Ganga\r\n" +
+    "CWC_Madurai,9.9252,78.1198,Vaigai,East Flowing Rivers\r\n" +
+    "CWC_Kampur,26.1550,92.5180,Kopili,Brahmaputra\r\n" +
+    "CWC_Musiri,10.9570,78.4370,Cauvery,Cauvery\r\n";
+  triggerDownload("cwc_verified_basin_outlets_sample.csv", sample, "text/csv;charset=utf-8;");
+
+  // Also auto-populate into batch table for instant 1-click testing
+  try {
+    const items = parseBatchCsv(sample);
+    BATCH_OUTLETS = items;
+    renderBatchPreview(items);
+    $("batchCountBadge").textContent = `${items.length} Outlets`;
+    $("batchCountBadge").style.display = "inline-block";
+    $("batchPreviewBox").style.display = "block";
+    $("btnBatchDelineate").disabled = false;
+    showToast(`Downloaded & loaded ${items.length} verified CWC outlets! Press 'Delineate All Watersheds'`, "success");
+  } catch (err) {}
+});
+
+// Dropzone file handling
+const batchDropzone = $("batchDropzone");
+const batchFileInput = $("batchFileInput");
+
+batchDropzone.addEventListener("click", () => batchFileInput.click());
+
+["dragenter", "dragover"].forEach(evt => {
+  batchDropzone.addEventListener(evt, e => {
+    e.preventDefault();
+    e.stopPropagation();
+    batchDropzone.classList.add("dragover");
+  });
+});
+
+["dragleave", "drop"].forEach(evt => {
+  batchDropzone.addEventListener(evt, e => {
+    e.preventDefault();
+    e.stopPropagation();
+    batchDropzone.classList.remove("dragover");
+  });
+});
+
+batchDropzone.addEventListener("drop", e => {
+  const files = e.dataTransfer.files;
+  if (files && files.length > 0) handleBatchFile(files[0]);
+});
+
+batchFileInput.addEventListener("change", () => {
+  if (batchFileInput.files && batchFileInput.files.length > 0) {
+    handleBatchFile(batchFileInput.files[0]);
+  }
+});
+
+function handleBatchFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const items = parseBatchCsv(e.target.result);
+      BATCH_OUTLETS = items;
+      renderBatchPreview(items);
+      $("batchCountBadge").textContent = `${items.length} Outlets`;
+      $("batchCountBadge").style.display = "inline-block";
+      $("batchPreviewBox").style.display = "block";
+      $("btnBatchDelineate").disabled = false;
+      showToast(`Loaded ${items.length} outlets from ${file.name}`, "success");
+    } catch (err) {
+      showToast("CSV Parse Error: " + err.message, "error");
+    }
+  };
+  reader.readAsText(file);
+}
+
+function parseBatchCsv(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length < 2) throw new Error("CSV file must contain a header row and at least one outlet row.");
+
+  const firstLine = lines[0];
+  const delim = firstLine.includes(",") ? "," : firstLine.includes(";") ? ";" : "\t";
+  const headers = firstLine.split(delim).map(h => h.trim().toLowerCase().replace(/^["']|["']$/g, ""));
+
+  let nameIdx = headers.findIndex(h => /^(basin_name|basin_code|basin|watershed|station_name|station|name|code|id|site)$/i.test(h));
+  let latIdx = headers.findIndex(h => /^(lat|latitude|y|lat_dd)$/i.test(h));
+  let lonIdx = headers.findIndex(h => /^(lon|long|lng|longitude|x|lon_dd)$/i.test(h));
+
+  if (latIdx === -1) latIdx = headers.findIndex(h => h.includes("lat"));
+  if (lonIdx === -1) lonIdx = headers.findIndex(h => h.includes("lon") || h.includes("lng"));
+  if (nameIdx === -1) nameIdx = headers.findIndex(h => h.includes("name") || h.includes("code") || h.includes("id"));
+
+  if (latIdx === -1 || lonIdx === -1) {
+    if (headers.length >= 3) { nameIdx = 0; latIdx = 1; lonIdx = 2; }
+    else if (headers.length === 2) { latIdx = 0; lonIdx = 1; nameIdx = -1; }
+    else throw new Error("Could not detect latitude and longitude columns in CSV.");
+  }
+
+  const items = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(delim).map(c => c.trim().replace(/^["']|["']$/g, ""));
+    if (cols.length <= Math.max(latIdx, lonIdx)) continue;
+    const lat = parseFloat(cols[latIdx]);
+    const lon = parseFloat(cols[lonIdx]);
+    if (isNaN(lat) || isNaN(lon)) continue;
+    const name = (nameIdx >= 0 && cols[nameIdx]) ? cols[nameIdx].replace(/[^a-zA-Z0-9_\-]/g, "_") : `Basin_${items.length + 1}`;
+    items.push({ name, lat, lon, status: "pending" });
+  }
+
+  if (!items.length) throw new Error("No valid coordinates found in uploaded CSV.");
+  return items;
+}
+
+function renderBatchPreview(items) {
+  const tbody = $("batchPreviewTbody");
+  tbody.innerHTML = items.map((it, idx) => `
+    <tr id="batchRow_${idx}">
+      <td style="font-weight: 500;">${it.name}</td>
+      <td>${it.lat.toFixed(3)}</td>
+      <td>${it.lon.toFixed(3)}</td>
+      <td><span class="batch-status-pill batch-status-${it.status}">${it.status}</span></td>
+    </tr>
+  `).join("");
+}
+
+function updateBatchRow(idx, status, extraText) {
+  const row = $(`batchRow_${idx}`);
+  if (!row) return;
+  const cell = row.children[3];
+  cell.innerHTML = `<span class="batch-status-pill batch-status-${status}">${extraText || status}</span>`;
+}
+
+// Run Batch Delineation
+$("btnBatchDelineate").addEventListener("click", runBatchDelineation);
+
+async function runBatchDelineation() {
+  if (isBusy || !BATCH_OUTLETS.length) return;
+  isBusy = true;
+  $("btnBatchDelineate").disabled = true;
+  $("btnBatchZip").disabled = true;
+  $("batchProgressWrap").style.display = "block";
+
+  BATCH_RESULTS = [];
+  gBatchBasins.clearLayers();
+  gBatchRivers.clearLayers();
+  gBatchMarkers.clearLayers();
+
+  const total = BATCH_OUTLETS.length;
+  let succeeded = 0;
+  const allBounds = [];
+
+  for (let i = 0; i < total; i++) {
+    const item = BATCH_OUTLETS[i];
+    item.status = "running";
+    updateBatchRow(i, "running", "running…");
+
+    const pct = Math.round((i / total) * 100);
+    $("batchProgressBar").style.width = `${pct}%`;
+    $("batchProgressPercent").textContent = `${pct}%`;
+    $("batchProgressLabel").textContent = `Delineating ${i + 1} of ${total}: ${item.name}`;
+
+    try {
+      const res = await fetch(`/api/delineate?lat=${item.lat}&lon=${item.lon}`);
+      const data = await res.json();
+      if (data.ok) {
+        item.status = "done";
+        item.area = data.area_km2;
+        item.order = data.max_strahler_order;
+        succeeded++;
+        updateBatchRow(i, "done", `${num(data.area_km2, 1)} km²`);
+
+        const color = BATCH_COLORS[i % BATCH_COLORS.length];
+        // Draw basin
+        const bLayer = L.geoJSON(data.geometry.watershed, {
+          style: { color, weight: 2.2, fillColor: color, fillOpacity: 0.18 }
+        }).bindPopup(`<strong>${item.name}</strong><br>Area: ${num(data.area_km2)} km²<br>Max Order: ${data.max_strahler_order}`);
+        bLayer.addTo(gBatchBasins);
+        try { allBounds.push(bLayer.getBounds()); } catch (e) {}
+
+        // Draw rivers
+        L.geoJSON(data.geometry.reaches, {
+          style: { color, weight: 1.6, opacity: 0.85 }
+        }).addTo(gBatchRivers);
+
+        // Marker
+        L.circleMarker([data.resolved.lat, data.resolved.lon], {
+          radius: 5, color, fillColor: "#fff", fillOpacity: 1, weight: 2
+        }).bindTooltip(`${item.name} Outlet`).addTo(gBatchMarkers);
+
+        BATCH_RESULTS.push({ name: item.name, ok: true, lat: item.lat, lon: item.lon, data });
+      } else {
+        item.status = "fail";
+        updateBatchRow(i, "fail", "failed");
+        BATCH_RESULTS.push({ name: item.name, ok: false, lat: item.lat, lon: item.lon, error: data.error });
+      }
+    } catch (e) {
+      item.status = "fail";
+      updateBatchRow(i, "fail", "error");
+      BATCH_RESULTS.push({ name: item.name, ok: false, lat: item.lat, lon: item.lon, error: e.message });
+    }
+  }
+
+  $("batchProgressBar").style.width = "100%";
+  $("batchProgressPercent").textContent = "100%";
+  $("batchProgressLabel").textContent = `Complete: ${succeeded} of ${total} succeeded`;
+
+  if (succeeded > 0) {
+    $("btnBatchZip").disabled = false;
+    showToast(`<strong>Batch Complete:</strong> ${succeeded} of ${total} watersheds delineated!`, "success");
+    if (allBounds.length > 0) {
+      let combined = allBounds[0];
+      for (let b of allBounds.slice(1)) combined.extend(b);
+      map.fitBounds(combined, { padding: [40, 40] });
+    }
+  } else {
+    showToast("Batch finished. No watersheds succeeded.", "error");
+  }
+
+  isBusy = false;
+  $("btnBatchDelineate").disabled = false;
+}
+
+// Generate Batch Summary CSV
+function generateBatchSummaryCsv(results) {
+  const headers = [
+    "Basin_Name",
+    "Outlet_Lat",
+    "Outlet_Lon",
+    "Resolved_Lat",
+    "Resolved_Lon",
+    "Snap_Distance_m",
+    "Area_km2",
+    "Perimeter_km",
+    "Basin_Length_km",
+    "Gravelius_Kc",
+    "Circularity_Rc",
+    "Form_Factor_Rf",
+    "Elongation_Re",
+    "Channel_Length_km",
+    "Mainstem_Length_km",
+    "Drainage_Density_km_km2",
+    "Stream_Frequency_per_km2",
+    "Channel_Maintenance_km2_km",
+    "Overland_Flow_km",
+    "Texture_Ratio_Smith_per_km",
+    "Max_Strahler_Order",
+    "Total_Reaches",
+    "Catchment_Units",
+    "Compute_ms",
+    "Status"
+  ];
+
+  const rows = [headers];
+  results.forEach(r => {
+    if (r.ok && r.data) {
+      const d = r.data;
+      const dist = d.resolution ? ((d.resolution.match(/dist_m:\s*([\d.]+)/) || [])[1] || "0") : "0";
+      rows.push([
+        r.name,
+        r.lat.toFixed(6),
+        r.lon.toFixed(6),
+        d.resolved.lat.toFixed(6),
+        d.resolved.lon.toFixed(6),
+        Number(dist).toFixed(1),
+        d.area_km2.toFixed(2),
+        d.perimeter_km.toFixed(2),
+        d.basin_length_km.toFixed(2),
+        d.gravelius_kc.toFixed(4),
+        d.circularity_rc.toFixed(4),
+        d.form_factor_rf.toFixed(4),
+        d.elongation_re.toFixed(4),
+        d.channel_length_km.toFixed(2),
+        d.mainstem_length_km.toFixed(2),
+        d.drainage_density.toFixed(4),
+        d.stream_frequency.toFixed(4),
+        d.channel_maintenance.toFixed(4),
+        d.overland_flow_km.toFixed(4),
+        d.texture_ratio.toFixed(4),
+        d.max_strahler_order,
+        d.reaches,
+        d.units,
+        Math.round((d.timing.delineate_s + d.timing.reaches_s) * 1000),
+        "SUCCESS"
+      ]);
+    } else {
+      rows.push([
+        r.name,
+        r.lat.toFixed(6),
+        r.lon.toFixed(6),
+        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+        `FAILED: ${r.error || "Unknown"}`
+      ]);
+    }
+  });
+
+  return rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\r\n");
+}
+
+// Download Batch ZIP
+$("btnBatchZip").addEventListener("click", async () => {
+  if (!BATCH_RESULTS.length) return;
+  if (typeof JSZip === "undefined") {
+    return showToast("JSZip library not loaded. Check internet connection.", "error");
+  }
+
+  showToast("Building ZIP archive with all basins and streams…", "info", true);
+  const zip = new JSZip();
+
+  // 1. Batch summary CSV
+  const summaryCsv = generateBatchSummaryCsv(BATCH_RESULTS);
+  zip.file("batch_morphometrics_summary.csv", summaryCsv);
+
+  // 2. Basins & Streams folders
+  const basinFolder = zip.folder("basins");
+  const streamFolder = zip.folder("streams");
+
+  const allBasinFeatures = [];
+  const allStreamFeatures = [];
+
+  BATCH_RESULTS.forEach(r => {
+    if (r.ok && r.data) {
+      const bName = r.name;
+      const bGeo = {
+        type: "Feature",
+        properties: {
+          watershed_name: bName,
+          area_km2: r.data.area_km2,
+          perimeter_km: r.data.perimeter_km,
+          basin_length_km: r.data.basin_length_km,
+          max_strahler_order: r.data.max_strahler_order,
+          drainage_density: r.data.drainage_density
+        },
+        geometry: r.data.geometry.watershed
+      };
+      basinFolder.file(`${bName}_basin.geojson`, JSON.stringify(bGeo, null, 2));
+      allBasinFeatures.push(bGeo);
+
+      const sGeo = r.data.geometry.reaches;
+      streamFolder.file(`${bName}_streams.geojson`, JSON.stringify(sGeo, null, 2));
+      if (sGeo && sGeo.features) {
+        sGeo.features.forEach(f => {
+          const clone = JSON.parse(JSON.stringify(f));
+          clone.properties = clone.properties || {};
+          clone.properties.watershed_name = bName;
+          allStreamFeatures.push(clone);
+        });
+      }
+    }
+  });
+
+  // 3. Combined GeoJSONs
+  zip.file("all_basins_combined.geojson", JSON.stringify({
+    type: "FeatureCollection",
+    features: allBasinFeatures
+  }, null, 2));
+
+  zip.file("all_streams_combined.geojson", JSON.stringify({
+    type: "FeatureCollection",
+    features: allStreamFeatures
+  }, null, 2));
+
+  const blob = await zip.generateAsync({ type: "blob" });
+  triggerDownload("delineated_watersheds_batch.zip", blob, "application/zip");
+  showToast("Batch ZIP package downloaded successfully!", "success");
+});
+
+// Initialize default pin
+updatePin(21.7051, 72.9959);
+</script>
+</body>
+</html>

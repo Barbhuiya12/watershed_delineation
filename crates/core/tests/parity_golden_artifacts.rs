@@ -1,0 +1,1315 @@
+//! Loader-independent validation for committed parity golden artifacts.
+//!
+//! This test intentionally stays independent from runtime session, engine, and
+//! graph domain types. That invariant is load-bearing: this artifact harness
+//! must keep passing while the committed M1 goldens remain inert bytes.
+
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+use geo::{MultiPolygon, polygon};
+use geozero::ToGeo;
+use geozero::wkb::Wkb;
+use pourpoint_core::algo::{
+    CANONICAL_WKB_DECIMAL_PRECISION, CANONICAL_WKB_VERSION, canonical_wkb_multi_polygon,
+};
+use serde::Deserialize;
+
+const FIXTURE_DIR: &str = "tests/fixtures/parity";
+const M1_SYNTHETIC_REFINED_DIR: &str = "v01_synthetic_refined";
+const V021_SYNTHETIC_REFINED_DIR: &str = "v021_synthetic_refined";
+const PROJECTED_GRASS_DIR: &str = "tiny-with-aux-d8-projected-grass";
+const PROJECTED_GRASS_GOLDEN: &str =
+    "goldens/tiny-with-aux-d8-projected-grass/projected_grass_refined.json";
+
+#[derive(Debug, Deserialize)]
+struct GoldenRecord {
+    #[serde(default)]
+    oracle: String,
+    #[serde(default)]
+    case_name: String,
+    canonical_wkb_hex: String,
+    area_km2: f64,
+    input_outlet: Outlet,
+    resolved_outlet: Outlet,
+    refined_outlet: Option<Outlet>,
+    terminal_id: i64,
+    upstream_ids: Vec<i64>,
+    resolution_method: String,
+    resolver_config: ResolverConfig,
+    refinement_outcome: RefinementOutcome,
+    #[serde(default)]
+    refinement_provenance: Option<RefinementProvenance>,
+    canonicalizer_version: String,
+    comparison_policy: ComparisonPolicy,
+    #[serde(default)]
+    remote_input_identity: Option<RemoteInputIdentity>,
+    #[serde(default)]
+    released_wheel_identity: Option<ReleasedWheelIdentity>,
+    #[serde(default)]
+    window_measurement: Option<WindowMeasurement>,
+    #[serde(default)]
+    carve_measurement: Option<serde_json::Value>,
+    #[serde(default)]
+    raster_interpretation: Option<RasterInterpretation>,
+    #[serde(default)]
+    fixture_provenance: Option<FixtureProvenance>,
+    #[serde(default)]
+    attestation: Option<Attestation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Outlet {
+    lon: f64,
+    lat: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolverConfig {
+    search_radius_m: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefinementOutcome {
+    status: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefinementProvenance {
+    strategy: String,
+    declaration_index: usize,
+    basis: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComparisonPolicy {
+    coordinate_abs_epsilon: f64,
+    area_km2_abs_epsilon: f64,
+    area_km2_rel_epsilon: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RasterInterpretation {
+    dimensions: RasterDimensions,
+    crs: String,
+    transform: [f64; 6],
+    origin: String,
+    pixel_size_degrees: PixelSize,
+    extent: RasterExtent,
+    pixel_interpretation: String,
+    flow_direction: RasterBandInterpretation,
+    flow_accumulation: RasterBandInterpretation,
+}
+
+#[derive(Debug, Deserialize)]
+struct RasterDimensions {
+    columns: usize,
+    rows: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct PixelSize {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RasterExtent {
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RasterBandInterpretation {
+    sample_type: String,
+    encoding: String,
+    nodata: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureProvenance {
+    content_hash_algorithm: String,
+    files: Vec<FileProvenance>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileProvenance {
+    path: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Attestation {
+    local_tiff_raster_source_gdal_tile_parity: String,
+    proof_command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteInputIdentity {
+    pinned_url: String,
+    artifacts: Vec<RemoteArtifactIdentity>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct ReleasedWheelIdentity {
+    filename: String,
+    metadata_name: String,
+    metadata_requires_python: String,
+    metadata_version: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteArtifactIdentity {
+    path: String,
+    etag: String,
+    content_length: u64,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WindowMeasurement {
+    terminal_bbox: RectRecord,
+    search_radius_m: f64,
+    flow_dir: RasterWindowStats,
+    flow_acc: RasterWindowStats,
+    http_total_bytes_in: u64,
+    windowing_ceiling_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RasterWindowStats {
+    tile_count: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RectRecord {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectedCarveMeasurement {
+    measurement_kind: String,
+    raster_source: String,
+    refinement_provenance: ProjectedRefinementProvenance,
+    derived_carved_cell_count: i64,
+    pixel_area_m2: i64,
+    integrality_tolerance: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectedRefinementProvenance {
+    strategy: String,
+    declaration_index: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedArtifactIndex {
+    schema: String,
+    artifacts: Vec<AcceptedIndexedArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedIndexedArtifact {
+    path: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedLiveEvidence {
+    case: String,
+    candidate: AcceptedManifestIdentity,
+    geometry: AcceptedGeometryIdentity,
+    hosted: AcceptedHostedIdentity,
+    invocation: AcceptedInvocation,
+    refinement: AcceptedRefinement,
+    result: AcceptedResult,
+    wheel: ReleasedWheelIdentity,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedManifestIdentity {
+    byte_count: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedGeometryIdentity {
+    canonicalizer: String,
+    decimal_precision: u32,
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedHostedIdentity {
+    base: String,
+    flow_dir: AcceptedHostedObject,
+    flow_acc: AcceptedHostedObject,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedHostedObject {
+    etag: String,
+    content_length: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedInvocation {
+    input_outlet: [f64; 2],
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedRefinement {
+    status: String,
+    provenance: RefinementProvenance,
+    refined_outlet: [f64; 2],
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedResult {
+    area_km2: f64,
+    resolution_method: String,
+    resolved_outlet: [f64; 2],
+    terminal_unit_id: i64,
+    upstream_unit_ids: Vec<i64>,
+}
+
+#[test]
+fn committed_seed_golden_validates_schema_and_canonical_wkb() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(FIXTURE_DIR)
+        .join("seed_golden.json");
+    let record: GoldenRecord = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("seed golden fixture should be readable"),
+    )
+    .expect("seed golden should match the golden schema");
+
+    assert_record_contract(&record);
+
+    let expected_wkb = decode_hex(&record.canonical_wkb_hex);
+    let seed_geometry = seed_geometry();
+    let actual_wkb =
+        canonical_wkb_multi_polygon(&seed_geometry).expect("seed geometry should canonicalize");
+
+    assert_eq!(actual_wkb, expected_wkb);
+    assert_canonical_wkb_idempotent(&actual_wkb);
+}
+
+#[test]
+fn committed_synthetic_refined_b_golden_validates_schema_and_canonical_wkb() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(FIXTURE_DIR)
+        .join("goldens/v01_synthetic_refined/oracle_b_synthetic_refined.json");
+    let record: GoldenRecord = serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("B golden fixture should be readable"),
+    )
+    .expect("B golden should match the golden schema");
+
+    assert_record_contract(&record);
+    assert_synthetic_refined_b_contract(&record);
+    assert_b_raster_fixture_bytes_match_recorded_hashes(&record);
+    assert_canonical_wkb_idempotent(&decode_hex(&record.canonical_wkb_hex));
+}
+
+#[test]
+fn committed_v021_synthetic_nonrefined_golden_validates_schema_and_canonical_wkb() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(FIXTURE_DIR)
+        .join("goldens/v021_synthetic_nonrefined/v021_synthetic_nonrefined.json");
+    let record: GoldenRecord = serde_json::from_str(
+        &fs::read_to_string(fixture_path)
+            .expect("v0.2.1 non-refined golden fixture should be readable"),
+    )
+    .expect("v0.2.1 non-refined golden should match the golden schema");
+
+    assert_record_contract(&record);
+    assert_v021_synthetic_nonrefined_contract(&record);
+    assert_canonical_wkb_idempotent(&decode_hex(&record.canonical_wkb_hex));
+}
+
+#[test]
+fn converted_v021_synthetic_refined_tiffs_match_m1_b_bytes() {
+    for raster_path in ["flow_dir.tif", "flow_acc.tif"] {
+        let m1_path = parity_fixture_path(M1_SYNTHETIC_REFINED_DIR).join(raster_path);
+        let v021_path = parity_fixture_path(V021_SYNTHETIC_REFINED_DIR).join(raster_path);
+        assert!(
+            v021_path.is_file(),
+            "converted v0.2.1 parity raster should exist at {v021_path:?}"
+        );
+        assert_eq!(
+            sha256_file(&v021_path),
+            sha256_file(&m1_path),
+            "converted v0.2.1 {raster_path} must remain byte-identical to M1 B"
+        );
+    }
+}
+
+#[test]
+fn committed_grit_nonrefined_a_goldens_validate_schema_and_metadata_offline() {
+    let records = read_golden_array("goldens/v01_grit_nonrefined/oracle_a_grit_nonrefined.json");
+    assert_eq!(records.len(), 2);
+    let names = records
+        .iter()
+        .map(|record| record.case_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["zurich", "repparfjord"]);
+
+    for record in &records {
+        assert_record_contract(record);
+        assert_eq!(record.oracle, "A");
+        assert_eq!(record.refinement_outcome.status, "NotApplied");
+        assert_eq!(
+            record.refinement_outcome.reason.as_deref(),
+            Some("no rasters available")
+        );
+        assert!(record.raster_interpretation.is_none());
+        assert!(record.window_measurement.is_none());
+        assert!(record.carve_measurement.is_none());
+        assert_remote_provenance_is_inert(record);
+        assert_remote_identity(
+            record,
+            "https://basin-delineations-public.upstream.tech/grit/1.0.0/",
+            &["manifest.json", "catchments.parquet", "graph.arrow"],
+        );
+        assert_canonical_wkb_idempotent(&decode_hex(&record.canonical_wkb_hex));
+    }
+}
+
+#[test]
+fn committed_grit_refined_goldens_validate_offline() {
+    let records = read_golden_array("goldens/v030_grit_refined/grit_refined.json");
+    assert_eq!(records.len(), 2);
+    let names = records
+        .iter()
+        .map(|record| record.case_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["horizontal-boundary", "distant-region"]);
+
+    for record in &records {
+        assert_record_contract(record);
+        assert_eq!(record.oracle, "GRIT-REFINED-LIVE");
+        assert_eq!(record.refinement_outcome.status, "Applied");
+        assert!(record.refinement_outcome.reason.is_none());
+        assert!(record.raster_interpretation.is_none());
+        assert!(record.window_measurement.is_none());
+        assert!(record.carve_measurement.is_none());
+        assert_remote_provenance_is_inert(record);
+        assert_grit_refined_matches_accepted_live_evidence(record);
+        assert_canonical_wkb_idempotent(&decode_hex(&record.canonical_wkb_hex));
+    }
+}
+
+#[test]
+fn committed_grit_refined_goldens_reject_broken_accepted_artifact_index() {
+    for case_name in ["horizontal-boundary", "distant-region"] {
+        let source = grit_live_evidence_path(case_name);
+        let scratch = std::env::temp_dir().join(format!(
+            "pourpoint-grit-refined-index-{}-{case_name}",
+            std::process::id()
+        ));
+        if scratch.exists() {
+            fs::remove_dir_all(&scratch).expect("stale scratch evidence should be removable");
+        }
+        fs::create_dir_all(&scratch).expect("scratch evidence directory should be creatable");
+
+        let index: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(source.join("artifact-index.json"))
+                .expect("accepted artifact index should be readable"),
+        )
+        .expect("accepted artifact index should be JSON");
+        for artifact in index["artifacts"]
+            .as_array()
+            .expect("accepted artifact index should list artifacts")
+        {
+            let relative = artifact["path"]
+                .as_str()
+                .expect("indexed artifact should have a path");
+            fs::copy(source.join(relative), scratch.join(relative))
+                .expect("indexed artifact should copy to scratch evidence");
+        }
+        fs::copy(
+            source.join("artifact-index.json"),
+            scratch.join("artifact-index.json"),
+        )
+        .expect("artifact index should copy to scratch evidence");
+
+        validate_accepted_artifact_index(&scratch)
+            .expect("an unchanged accepted evidence tree should match its artifact index");
+        let geometry_path = scratch.join("geometry.canonical.wkb");
+        let mut geometry = fs::read(&geometry_path).expect("scratch geometry should be readable");
+        geometry.push(0);
+        fs::write(&geometry_path, geometry).expect("scratch geometry should be corruptible");
+
+        let error = validate_accepted_artifact_index(&scratch)
+            .expect_err("a changed accepted geometry must invalidate its artifact index");
+        assert!(error.contains("geometry.canonical.wkb"));
+        fs::remove_dir_all(&scratch).expect("scratch evidence should be removable");
+    }
+}
+
+#[test]
+fn committed_merit_refined_c_goldens_validate_schema_and_metadata_offline() {
+    let records = read_golden_array("goldens/v01_merit_refined/oracle_c_merit_refined.json");
+    assert_eq!(records.len(), 1);
+    let names = records
+        .iter()
+        .map(|record| record.case_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["rhine_basel"]);
+
+    for record in &records {
+        assert_record_contract(record);
+        assert_eq!(record.oracle, "C");
+        assert_eq!(record.case_name, "rhine_basel");
+        assert_eq!(record.refinement_outcome.status, "Applied");
+        assert!(record.carve_measurement.is_none());
+        assert_remote_provenance_is_inert(record);
+        assert_remote_identity(
+            record,
+            "https://basin-delineations-public.upstream.tech/merit-basins/0.1.0/",
+            &[
+                "manifest.json",
+                "catchments.parquet",
+                "graph.arrow",
+                "snap.parquet",
+                "flow_dir.tif",
+                "flow_acc.tif",
+            ],
+        );
+        assert_merit_refined_c_contract(record);
+        assert_c_raster_remote_identity_has_no_content_hashes(record);
+        assert_canonical_wkb_idempotent(&decode_hex(&record.canonical_wkb_hex));
+    }
+}
+
+#[test]
+fn committed_projected_grass_golden_validates_offline_contract() {
+    let record = read_golden_record(PROJECTED_GRASS_GOLDEN);
+    assert_record_contract(&record);
+    assert_eq!(record.refinement_outcome.status, "Applied");
+    assert!(record.refinement_outcome.reason.is_none());
+    assert!(record.raster_interpretation.is_none());
+    assert_canonical_wkb_idempotent(&decode_hex(&record.canonical_wkb_hex));
+
+    let carve: ProjectedCarveMeasurement = serde_json::from_value(
+        record
+            .carve_measurement
+            .clone()
+            .expect("projected golden should contain a carve measurement"),
+    )
+    .expect("projected carve measurement should match its record-specific contract");
+    assert_eq!(
+        carve.measurement_kind,
+        "DERIVED from public TerminalRefinement::Applied geometry"
+    );
+    assert_eq!(
+        carve.raster_source,
+        "LocalTiffRasterSource::with_encoding(hfx::FlowDirEncoding::Grass) -> EncodedLocalTiffRasterSource"
+    );
+    assert_eq!(carve.refinement_provenance.strategy, "BuiltInD8");
+    assert_eq!(carve.refinement_provenance.declaration_index, 0);
+    assert!(carve.derived_carved_cell_count >= 16);
+    assert_eq!(carve.pixel_area_m2, 1_000_000);
+    assert_eq!(carve.integrality_tolerance, 1e-6);
+
+    assert_projected_manifest_contract();
+    assert_projected_fixture_provenance(&record);
+}
+
+#[test]
+fn committed_fixture_manifests_do_not_declare_d8_v1() {
+    assert_no_d8_v1_manifests(&parity_fixture_path(""));
+}
+
+#[test]
+fn in_test_geometry_canonical_wkb_is_idempotent_without_runtime_dependencies() {
+    let geometry = MultiPolygon::new(vec![
+        polygon![
+            (x: 2.0, y: 0.0),
+            (x: 0.0, y: 0.0),
+            (x: 0.0, y: 1.0),
+            (x: 2.0, y: 1.0)
+        ],
+        polygon![
+            (x: -1.0, y: 0.0),
+            (x: -1.0, y: 1.0),
+            (x: -2.0, y: 1.0),
+            (x: -2.0, y: 0.0)
+        ],
+    ]);
+
+    let canonical =
+        canonical_wkb_multi_polygon(&geometry).expect("in-test geometry should canonicalize");
+    assert_canonical_wkb_idempotent(&canonical);
+}
+
+fn assert_record_contract(record: &GoldenRecord) {
+    assert!(!record.canonical_wkb_hex.is_empty());
+    assert_eq!(record.canonical_wkb_hex.len() % 2, 0);
+    assert!(
+        record
+            .canonical_wkb_hex
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
+    assert_eq!(record.canonicalizer_version, CANONICAL_WKB_VERSION);
+    assert_eq!(CANONICAL_WKB_DECIMAL_PRECISION, 6);
+    assert!(record.area_km2.is_finite() && record.area_km2 > 0.0);
+    assert_outlet_finite(&record.input_outlet);
+    assert_outlet_finite(&record.resolved_outlet);
+    assert!(record.terminal_id >= 0);
+    assert!(record.upstream_ids.windows(2).all(|ids| ids[0] < ids[1]));
+    assert!(!record.upstream_ids.is_empty());
+    assert!(!record.resolution_method.is_empty());
+    assert!(record.resolver_config.search_radius_m.is_finite());
+    assert!(record.resolver_config.search_radius_m >= 0.0);
+    assert!(!record.refinement_outcome.status.is_empty());
+    if record.refinement_outcome.status == "Applied" {
+        assert_outlet_finite(
+            record
+                .refined_outlet
+                .as_ref()
+                .expect("Applied refinement should record refined outlet"),
+        );
+    } else {
+        assert!(record.refined_outlet.is_none());
+    }
+    if let Some(reason) = &record.refinement_outcome.reason {
+        assert!(!reason.is_empty());
+    }
+    assert_eq!(record.comparison_policy.coordinate_abs_epsilon, 0.000001);
+    assert!(record.comparison_policy.area_km2_abs_epsilon > 0.0);
+    assert!(record.comparison_policy.area_km2_rel_epsilon > 0.0);
+}
+
+fn assert_synthetic_refined_b_contract(record: &GoldenRecord) {
+    assert_eq!(record.refinement_outcome.status, "Applied");
+    assert_eq!(record.terminal_id, 1);
+    assert_eq!(record.upstream_ids, [1]);
+    assert!(record.area_km2 > 0.0);
+
+    let raster = record
+        .raster_interpretation
+        .as_ref()
+        .expect("B golden should record raster interpretation metadata");
+    assert_eq!(raster.dimensions.columns, 5);
+    assert_eq!(raster.dimensions.rows, 5);
+    assert_eq!(raster.crs, "EPSG:4326");
+    assert_eq!(raster.transform, [0.0, 1.0, 0.0, 0.0, 0.0, -1.0]);
+    assert!(!raster.origin.is_empty());
+    assert_eq!(raster.pixel_size_degrees.x, 1.0);
+    assert_eq!(raster.pixel_size_degrees.y, -1.0);
+    assert_eq!(raster.extent.x_min, 0.0);
+    assert_eq!(raster.extent.x_max, 5.0);
+    assert_eq!(raster.extent.y_min, -5.0);
+    assert_eq!(raster.extent.y_max, 0.0);
+    assert_outlet_in_raster_extent(
+        record
+            .refined_outlet
+            .as_ref()
+            .expect("B golden should record refined outlet"),
+        &raster.extent,
+    );
+    assert!(raster.pixel_interpretation.contains("PixelIsArea"));
+    assert_eq!(raster.flow_direction.sample_type, "uint8");
+    assert_eq!(raster.flow_direction.encoding, "ESRI D8");
+    assert_eq!(raster.flow_direction.nodata, "255");
+    assert_eq!(raster.flow_accumulation.sample_type, "float32");
+    assert_eq!(raster.flow_accumulation.encoding, "accumulation");
+    assert!(raster.flow_accumulation.nodata.contains("NaN"));
+
+    let provenance = record
+        .fixture_provenance
+        .as_ref()
+        .expect("B golden should record inert fixture provenance");
+    assert_eq!(provenance.content_hash_algorithm, "sha256");
+    let paths = provenance
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        [
+            "manifest.json",
+            "catchments.parquet",
+            "graph.arrow",
+            "flow_dir.tif",
+            "flow_acc.tif"
+        ]
+    );
+    for file in &provenance.files {
+        assert!(file.size_bytes > 0);
+        assert_eq!(file.sha256.len(), 64);
+        assert!(file.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+    assert_b_fixture_file_metadata(record, "flow_dir.tif", 371);
+    assert_b_fixture_file_metadata(record, "flow_acc.tif", 446);
+
+    let attestation = record
+        .attestation
+        .as_ref()
+        .expect("B golden should record raster decode parity attestation");
+    assert!(
+        attestation
+            .local_tiff_raster_source_gdal_tile_parity
+            .contains("tile-identical")
+    );
+    assert!(attestation.proof_command.contains("pourpoint-gdal"));
+}
+
+fn assert_v021_synthetic_nonrefined_contract(record: &GoldenRecord) {
+    assert_eq!(record.refinement_outcome.status, "Disabled");
+    assert!(record.refinement_outcome.reason.is_none());
+    assert!(record.refined_outlet.is_none());
+    assert_eq!(record.terminal_id, 1);
+    assert_eq!(record.upstream_ids, [1]);
+    assert_eq!(
+        record.resolution_method,
+        "point-in-polygon(candidates_considered=1,tie_break=none)"
+    );
+    assert_eq!(record.resolver_config.search_radius_m, 1000.0);
+    assert_eq!(record.input_outlet.lon, 2.5);
+    assert_eq!(record.input_outlet.lat, -2.5);
+    assert_eq!(record.resolved_outlet.lon, 2.5);
+    assert_eq!(record.resolved_outlet.lat, -2.5);
+    assert_eq!(record.canonical_wkb_hex.len(), 204);
+}
+
+fn assert_remote_identity(record: &GoldenRecord, pinned_url: &str, expected_paths: &[&str]) {
+    let identity = record
+        .remote_input_identity
+        .as_ref()
+        .expect("real oracle should record remote input identity");
+    assert_eq!(identity.pinned_url, pinned_url);
+    let paths = identity
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, expected_paths);
+    for artifact in &identity.artifacts {
+        assert!(!artifact.etag.is_empty());
+        assert!(artifact.content_length > 0);
+        assert!(
+            artifact.sha256.is_none(),
+            "historical remote identity must remain ETag plus Content-Length only"
+        );
+        assert!(
+            artifact.extra.is_empty(),
+            "unexpected remote identity metadata for {}: {:?}",
+            artifact.path,
+            artifact.extra
+        );
+    }
+}
+
+fn assert_grit_refined_matches_accepted_live_evidence(record: &GoldenRecord) {
+    let evidence_dir = grit_live_evidence_path(&record.case_name);
+    validate_accepted_artifact_index(&evidence_dir)
+        .expect("accepted live evidence should match its retained artifact index");
+    let evidence: AcceptedLiveEvidence = serde_json::from_str(
+        &fs::read_to_string(evidence_dir.join("evidence.json"))
+            .expect("accepted live evidence should be readable"),
+    )
+    .expect("accepted live evidence should match its retained schema");
+
+    assert_eq!(evidence.case, record.case_name);
+    assert_eq!(evidence.candidate.byte_count, 1_426);
+    assert_eq!(
+        evidence.candidate.sha256,
+        "02339ff92cbfd1d2ea57bb5332cb843b98115cd7a7395f64c14fac78d2ed643c"
+    );
+    let released_wheel = record
+        .released_wheel_identity
+        .as_ref()
+        .expect("refined GRIT golden should pin its released wheel");
+    assert_eq!(released_wheel, &evidence.wheel);
+    assert_eq!(
+        released_wheel,
+        &ReleasedWheelIdentity {
+            filename: "pourpoint-0.3.0-cp39-abi3-macosx_11_0_arm64.whl".to_owned(),
+            metadata_name: "pourpoint".to_owned(),
+            metadata_requires_python: ">=3.9".to_owned(),
+            metadata_version: "0.3.0".to_owned(),
+            sha256: "a79ebc38be0cdc39247fd07eb608750536c982999954bd68e3ccf5599fefdabe".to_owned(),
+            size_bytes: 22_310_060,
+        }
+    );
+    assert_eq!(
+        evidence.geometry.canonicalizer,
+        record.canonicalizer_version
+    );
+    assert_eq!(evidence.geometry.decimal_precision, 6);
+    assert_eq!(record.input_outlet.lon, evidence.invocation.input_outlet[0]);
+    assert_eq!(record.input_outlet.lat, evidence.invocation.input_outlet[1]);
+    assert_eq!(
+        record.resolved_outlet.lon,
+        evidence.result.resolved_outlet[0]
+    );
+    assert_eq!(
+        record.resolved_outlet.lat,
+        evidence.result.resolved_outlet[1]
+    );
+    let refined_outlet = record
+        .refined_outlet
+        .as_ref()
+        .expect("refined GRIT golden should record its refined outlet");
+    assert_eq!(refined_outlet.lon, evidence.refinement.refined_outlet[0]);
+    assert_eq!(refined_outlet.lat, evidence.refinement.refined_outlet[1]);
+    assert_eq!(evidence.refinement.status, "applied");
+    assert_eq!(record.area_km2, evidence.result.area_km2);
+    assert_eq!(record.resolution_method, evidence.result.resolution_method);
+    assert_eq!(record.terminal_id, evidence.result.terminal_unit_id);
+    assert_eq!(record.upstream_ids, evidence.result.upstream_unit_ids);
+    assert_eq!(record.resolver_config.search_radius_m, 1_000.0);
+
+    let provenance = record
+        .refinement_provenance
+        .as_ref()
+        .expect("refined GRIT golden should record applied provenance");
+    assert_eq!(provenance.strategy, "BuiltInD8");
+    assert_eq!(provenance.strategy, evidence.refinement.provenance.strategy);
+    assert_eq!(
+        provenance.declaration_index,
+        evidence.refinement.provenance.declaration_index
+    );
+    assert_eq!(provenance.declaration_index, 2);
+    assert_eq!(provenance.basis, evidence.refinement.provenance.basis);
+    assert_eq!(
+        provenance.basis,
+        "identity_derived_from_pinned_wheel_shipped_Engine_path"
+    );
+
+    let geometry_path = evidence_dir.join("geometry.canonical.wkb");
+    let retained_geometry =
+        fs::read(&geometry_path).expect("accepted canonical geometry should be readable");
+    assert_eq!(decode_hex(&record.canonical_wkb_hex), retained_geometry);
+    assert_eq!(
+        fs::metadata(&geometry_path)
+            .expect("accepted canonical geometry metadata should be readable")
+            .len(),
+        evidence.geometry.size_bytes
+    );
+    assert_eq!(sha256_file(&geometry_path), evidence.geometry.sha256);
+
+    let identity = record
+        .remote_input_identity
+        .as_ref()
+        .expect("refined GRIT golden should pin public object identities");
+    assert_eq!(identity.pinned_url, evidence.hosted.base);
+    assert_eq!(
+        identity.pinned_url,
+        "https://basin-delineations-public.upstream.tech/grit/hfx-v0.3.0/"
+    );
+    let paths = identity
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        [
+            "manifest.json",
+            "aux/d8/flow_dir.tif",
+            "aux/d8/flow_acc.tif"
+        ]
+    );
+
+    let manifest = find_remote_artifact(record, "manifest.json");
+    assert_eq!(manifest.content_length, evidence.candidate.byte_count);
+    assert_eq!(
+        manifest.sha256.as_deref(),
+        Some(evidence.candidate.sha256.as_str())
+    );
+    assert_eq!(
+        sha256_file(&evidence_dir.join("served-manifest.json")),
+        evidence.candidate.sha256
+    );
+    assert_completed_manifest_read_matches(manifest, &evidence_dir.join("reads.jsonl"));
+    assert_hosted_object_matches(
+        find_remote_artifact(record, "aux/d8/flow_dir.tif"),
+        &evidence.hosted.flow_dir,
+    );
+    assert_hosted_object_matches(
+        find_remote_artifact(record, "aux/d8/flow_acc.tif"),
+        &evidence.hosted.flow_acc,
+    );
+}
+
+fn validate_accepted_artifact_index(evidence_dir: &Path) -> Result<(), String> {
+    let index_path = evidence_dir.join("artifact-index.json");
+    let index_text = fs::read_to_string(&index_path)
+        .map_err(|error| format!("cannot read {index_path:?}: {error}"))?;
+    let index: AcceptedArtifactIndex = serde_json::from_str(&index_text)
+        .map_err(|error| format!("invalid accepted artifact index {index_path:?}: {error}"))?;
+    if index.schema != "pourpoint.released-wheel-proof-artifact-index.v1" {
+        return Err(format!(
+            "unsupported accepted artifact index schema {:?}",
+            index.schema
+        ));
+    }
+    if index.artifacts.is_empty() {
+        return Err("accepted artifact index must not be empty".to_string());
+    }
+
+    let mut paths = std::collections::HashSet::new();
+    for artifact in index.artifacts {
+        let relative = Path::new(&artifact.path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "indexed artifact path is not relative: {}",
+                artifact.path
+            ));
+        }
+        if !paths.insert(artifact.path.clone()) {
+            return Err(format!("accepted artifact index repeats {}", artifact.path));
+        }
+
+        let path = evidence_dir.join(relative);
+        let metadata = fs::metadata(&path).map_err(|error| {
+            format!("indexed artifact {} is unavailable: {error}", artifact.path)
+        })?;
+        if metadata.len() != artifact.size_bytes {
+            return Err(format!(
+                "indexed artifact {} has size {}, expected {}",
+                artifact.path,
+                metadata.len(),
+                artifact.size_bytes
+            ));
+        }
+        let actual_sha256 = sha256_file_result(&path)?;
+        if actual_sha256 != artifact.sha256 {
+            return Err(format!(
+                "indexed artifact {} has sha256 {}, expected {}",
+                artifact.path, actual_sha256, artifact.sha256
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file_result(path: &Path) -> Result<String, String> {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("cannot run shasum for {path:?}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "shasum failed for {path:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("shasum output for {path:?} is not utf8: {error}"))?
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .ok_or_else(|| format!("shasum output for {path:?} has no hash"))
+}
+
+fn grit_live_evidence_path(case_name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/evidence/grit-d8-live/postpublication")
+        .join(case_name)
+}
+
+fn find_remote_artifact<'a>(record: &'a GoldenRecord, path: &str) -> &'a RemoteArtifactIdentity {
+    record
+        .remote_input_identity
+        .as_ref()
+        .expect("real oracle should record remote input identity")
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.path == path)
+        .unwrap_or_else(|| panic!("remote identity should record {path}"))
+}
+
+fn assert_hosted_object_matches(
+    artifact: &RemoteArtifactIdentity,
+    accepted: &AcceptedHostedObject,
+) {
+    assert_eq!(artifact.etag, accepted.etag);
+    assert_eq!(artifact.content_length, accepted.content_length);
+    assert!(artifact.sha256.is_none());
+    assert!(artifact.extra.is_empty());
+}
+
+fn assert_completed_manifest_read_matches(artifact: &RemoteArtifactIdentity, path: &Path) {
+    let manifest_read = fs::read_to_string(path)
+        .expect("accepted hosted-read telemetry should be readable")
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("accepted hosted-read telemetry line should be JSON")
+        })
+        .find(|read| read["key"] == "manifest.json")
+        .expect("accepted hosted-read telemetry should include the public manifest read");
+    assert_eq!(manifest_read["completed"], true);
+    assert_eq!(manifest_read["origin"], "hosted");
+    assert_eq!(manifest_read["status"], 200);
+    assert_eq!(manifest_read["bytes_received"], artifact.content_length);
+    assert_eq!(
+        manifest_read["response_content_length"],
+        artifact.content_length
+    );
+    assert_eq!(manifest_read["etag"], artifact.etag);
+}
+
+fn assert_merit_refined_c_contract(record: &GoldenRecord) {
+    assert!(record.area_km2 > 0.0);
+
+    let raster = record
+        .raster_interpretation
+        .as_ref()
+        .expect("C golden should record MERIT raster interpretation");
+    assert!(raster.origin.contains("remote COG"));
+    assert!(raster.pixel_interpretation.contains("PixelIsArea"));
+    assert_eq!(raster.flow_direction.sample_type, "uint8");
+    assert_eq!(raster.flow_direction.encoding, "ESRI D8");
+    assert_eq!(raster.flow_accumulation.sample_type, "float32");
+
+    let window = record
+        .window_measurement
+        .as_ref()
+        .expect("C golden should record window measurement");
+    assert_eq!(window.search_radius_m, 5000.0);
+    assert_eq!(
+        window.search_radius_m,
+        record.resolver_config.search_radius_m
+    );
+    assert!(window.flow_dir.tile_count > 0);
+    assert!(window.flow_acc.tile_count > 0);
+    assert!(window.flow_dir.bytes > 0);
+    assert!(window.flow_acc.bytes > 0);
+    assert!(window.http_total_bytes_in <= window.windowing_ceiling_bytes);
+    assert!(window.windowing_ceiling_bytes <= 500 * 1024 * 1024);
+    assert_rect_valid(&window.terminal_bbox);
+
+    let attestation = record
+        .attestation
+        .as_ref()
+        .expect("C golden should record GDAL parity attestation");
+    assert!(
+        attestation
+            .local_tiff_raster_source_gdal_tile_parity
+            .contains("tile-identical")
+    );
+    assert!(
+        attestation
+            .proof_command
+            .contains("merit_c_windows_tiff_match_gdal")
+    );
+}
+
+fn assert_outlet_finite(outlet: &Outlet) {
+    assert!(outlet.lon.is_finite());
+    assert!(outlet.lat.is_finite());
+    assert!((-180.0..=180.0).contains(&outlet.lon));
+    assert!((-90.0..=90.0).contains(&outlet.lat));
+}
+
+fn assert_outlet_in_raster_extent(outlet: &Outlet, extent: &RasterExtent) {
+    assert!((extent.x_min..=extent.x_max).contains(&outlet.lon));
+    assert!((extent.y_min..=extent.y_max).contains(&outlet.lat));
+}
+
+fn assert_remote_provenance_is_inert(record: &GoldenRecord) {
+    let provenance = record
+        .fixture_provenance
+        .as_ref()
+        .expect("remote oracle should record inert fixture provenance marker");
+    assert_eq!(provenance.content_hash_algorithm, "sha256");
+    assert!(
+        provenance.files.is_empty(),
+        "remote oracle provenance must remain inert and must not carry hashes"
+    );
+}
+
+fn assert_b_fixture_file_metadata(record: &GoldenRecord, path: &str, size_bytes: u64) {
+    let file = find_fixture_file(record, path);
+    assert_eq!(file.size_bytes, size_bytes);
+    assert_eq!(file.sha256.len(), 64);
+    assert!(file.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+fn assert_b_raster_fixture_bytes_match_recorded_hashes(record: &GoldenRecord) {
+    for raster_path in ["flow_dir.tif", "flow_acc.tif"] {
+        let recorded = find_fixture_file(record, raster_path);
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(FIXTURE_DIR)
+            .join(M1_SYNTHETIC_REFINED_DIR)
+            .join(raster_path);
+        let metadata = fs::metadata(&fixture_path).unwrap_or_else(|error| {
+            panic!("B raster fixture should exist at {fixture_path:?}: {error}")
+        });
+        assert_eq!(metadata.len(), recorded.size_bytes);
+        assert_eq!(sha256_file(&fixture_path), recorded.sha256);
+    }
+}
+
+fn parity_fixture_path(relative: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(FIXTURE_DIR)
+        .join(relative)
+}
+
+fn find_fixture_file<'a>(record: &'a GoldenRecord, path: &str) -> &'a FileProvenance {
+    record
+        .fixture_provenance
+        .as_ref()
+        .expect("B golden should record fixture provenance")
+        .files
+        .iter()
+        .find(|file| file.path == path)
+        .unwrap_or_else(|| panic!("B fixture provenance should record {path}"))
+}
+
+fn assert_c_raster_remote_identity_has_no_content_hashes(record: &GoldenRecord) {
+    let identity = record
+        .remote_input_identity
+        .as_ref()
+        .expect("C golden should record remote input identity");
+    for raster_path in ["flow_dir.tif", "flow_acc.tif"] {
+        let artifact = identity
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == raster_path)
+            .unwrap_or_else(|| panic!("C remote identity should record {raster_path}"));
+        assert!(artifact.etag.starts_with('"'));
+        assert!(
+            artifact.etag.trim_matches('"').contains('-'),
+            "C raster ETag should be recorded as the remote multipart ETag"
+        );
+        assert!(artifact.content_length > 0);
+        assert!(
+            artifact.extra.is_empty(),
+            "C raster identity must be ETag plus Content-Length only"
+        );
+    }
+}
+
+fn assert_rect_valid(rect: &RectRecord) {
+    assert!(rect.min_x.is_finite());
+    assert!(rect.min_y.is_finite());
+    assert!(rect.max_x.is_finite());
+    assert!(rect.max_y.is_finite());
+    assert!(rect.min_x < rect.max_x);
+    assert!(rect.min_y < rect.max_y);
+}
+
+fn read_golden_record(relative: &str) -> GoldenRecord {
+    serde_json::from_str(
+        &fs::read_to_string(parity_fixture_path(relative))
+            .expect("single golden fixture should be readable"),
+    )
+    .expect("single golden should match the golden schema")
+}
+
+fn assert_projected_manifest_contract() {
+    let manifest_path = parity_fixture_path(PROJECTED_GRASS_DIR).join("manifest.json");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(manifest_path).expect("projected manifest should be readable"),
+    )
+    .expect("projected manifest should be valid JSON");
+    assert_eq!(manifest["format_version"], "0.3.0");
+    assert_eq!(manifest["crs"], "EPSG:4326");
+    let declarations = manifest["auxiliary"]
+        .as_array()
+        .expect("projected manifest auxiliary should be an array");
+    assert_eq!(declarations.len(), 1);
+    let declaration = &declarations[0];
+    assert_eq!(declaration["schema"], "hfx.aux.d8_raster.v2");
+    assert_eq!(declaration["metadata"]["crs"], "EPSG:8857");
+    assert_eq!(declaration["metadata"]["flow_dir_encoding"], "grass");
+    assert_eq!(declaration["metadata"]["flow_acc_units"], "km2");
+    assert_eq!(
+        declaration["artifacts"]["flow_dir"],
+        "aux/d8/projected/flow_dir.tif"
+    );
+    assert_eq!(
+        declaration["artifacts"]["flow_acc"],
+        "aux/d8/projected/flow_acc.tif"
+    );
+}
+
+fn assert_projected_fixture_provenance(record: &GoldenRecord) {
+    let provenance = record
+        .fixture_provenance
+        .as_ref()
+        .expect("projected golden should record fixture provenance");
+    assert_eq!(provenance.content_hash_algorithm, "sha256");
+    let expected = [
+        (
+            "README.md",
+            291,
+            "939093e14ee15334dc1b822e7ed29fd151106d2335c42363e77390d9e5f11f6f",
+        ),
+        (
+            "manifest.json",
+            646,
+            "ef341491630bdfb2350add137d3f0ff8332989e15f2f74b9815318e28667a7a8",
+        ),
+        (
+            "catchments.parquet",
+            5102,
+            "c0a6a6641f0fce3d1e7e8ce7d7749e2a1a6dc020d02a436fcb8d64b8f9e15411",
+        ),
+        (
+            "graph.parquet",
+            2227,
+            "359827468df9bfca4c87b4200240a1e6bbf41d15a00bb477fe29eba5286d9b79",
+        ),
+        (
+            "aux/d8/projected/flow_dir.tif",
+            1232,
+            "fece90b5cafc5ff00b988674a2c859c29d67c45927091de23dd394a4af78a7da",
+        ),
+        (
+            "aux/d8/projected/flow_acc.tif",
+            1895,
+            "1d3334214e9ae575fe4e56e468302fa59d515d183dfa3c1568979210a2d6a917",
+        ),
+    ];
+    assert_eq!(provenance.files.len(), expected.len());
+    let fixture_dir = parity_fixture_path(PROJECTED_GRASS_DIR);
+    for (path, size_bytes, sha256) in expected {
+        let recorded = provenance
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap_or_else(|| panic!("projected provenance should record {path}"));
+        assert_eq!(recorded.size_bytes, size_bytes);
+        assert_eq!(recorded.sha256, sha256);
+        let fixture_path = fixture_dir.join(path);
+        assert!(fixture_path.is_file(), "fixture file should exist: {path}");
+        assert_eq!(
+            fs::metadata(&fixture_path)
+                .expect("fixture metadata should be readable")
+                .len(),
+            size_bytes
+        );
+        assert_eq!(sha256_file(&fixture_path), sha256);
+    }
+
+    // The exact artifact hashes above bind these fixture-contract facts without
+    // requiring GDAL or another TIFF loader in this loader-independent test.
+    let flow_direction_contract = ("signed int8", -128_i64);
+    let flow_accumulation_contract = ("signed int32", -2_147_483_648_i64);
+    assert_eq!(flow_direction_contract, ("signed int8", -128));
+    assert_eq!(flow_accumulation_contract, ("signed int32", -2_147_483_648));
+}
+
+fn assert_no_d8_v1_manifests(directory: &Path) {
+    for entry in fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("fixture directory should be readable: {error}"))
+    {
+        let entry = entry.expect("fixture directory entry should be readable");
+        let path = entry.path();
+        if path.is_dir() {
+            assert_no_d8_v1_manifests(&path);
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("manifest.json") {
+            let contents = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("manifest should be readable at {path:?}: {error}"));
+            assert!(
+                !contents.contains("\"hfx.aux.d8_raster.v1\""),
+                "committed fixture manifest must not declare D8 v1: {path:?}"
+            );
+        }
+    }
+}
+
+fn read_golden_array(relative: &str) -> Vec<GoldenRecord> {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(FIXTURE_DIR)
+        .join(relative);
+    serde_json::from_str(
+        &fs::read_to_string(fixture_path).expect("golden fixture should be readable"),
+    )
+    .expect("golden array should match the golden schema")
+}
+
+fn assert_canonical_wkb_idempotent(canonical: &[u8]) {
+    assert_eq!(canonical[0], 0x01);
+
+    let decoded = match Wkb(canonical)
+        .to_geo()
+        .expect("canonical WKB should decode")
+    {
+        geo::Geometry::MultiPolygon(mp) => mp,
+        other => panic!("expected canonical MultiPolygon WKB, got {other:?}"),
+    };
+    let normalized_again =
+        canonical_wkb_multi_polygon(&decoded).expect("decoded canonical WKB should recanonicalize");
+
+    assert_eq!(canonical, normalized_again);
+}
+
+fn seed_geometry() -> MultiPolygon<f64> {
+    MultiPolygon::new(vec![polygon![
+        (x: 1.0, y: 0.0),
+        (x: 1.0, y: 1.0),
+        (x: 0.0, y: 1.0),
+        (x: 0.0, y: 0.0)
+    ]])
+}
+
+fn decode_hex(hex: &str) -> Vec<u8> {
+    assert_eq!(hex.len() % 2, 0);
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_digit(pair[0]);
+            let low = hex_digit(pair[1]);
+            (high << 4) | low
+        })
+        .collect()
+}
+
+fn sha256_file(path: &Path) -> String {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .unwrap_or_else(|error| panic!("shasum should run for {path:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "shasum failed for {path:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("shasum output should be utf8")
+        .split_whitespace()
+        .next()
+        .expect("shasum output should include a hash")
+        .to_string()
+}
+
+fn hex_digit(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        other => panic!("invalid hex digit {other}"),
+    }
+}

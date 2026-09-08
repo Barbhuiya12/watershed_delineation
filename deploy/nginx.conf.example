@@ -1,0 +1,39 @@
+# Nginx Reverse Proxy Configuration for INCLINE Watershed Delineation System
+# Place in /etc/nginx/sites-available/incline-watershed and symlink to sites-enabled/
+
+upstream incline_backend {
+    server 127.0.0.1:8787;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name watershed.incline.iitmandi.ac.in;
+
+    # Redirect all HTTP traffic to HTTPS (uncomment when SSL certificate is installed)
+    # return 301 https://$host$request_uri;
+
+    client_max_body_size 50M;
+
+    # Gzip compression for high-performance GeoJSON / CSV delivery
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml+rss text/javascript;
+    gzip_vary on;
+    gzip_min_length 1024;
+
+    location / {
+        proxy_pass http://incline_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Extended timeouts for large continental watershed delineations
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 120s;
+        proxy_read_timeout 120s;
+    }
+}

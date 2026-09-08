@@ -1,0 +1,2249 @@
+//! delineate : GeoCoord × HFX × Options → Watershed
+//!
+//! Engine composition layer wires outlet resolution, upstream traversal,
+//! terminal refinement, and watershed assembly into a single `delineate()` call.
+
+use std::collections::{HashMap, HashSet};
+
+use geo::{BoundingRect, MultiPolygon};
+use hfx::{BoundingBox, Level, OutletCoord, UnitId};
+use rayon::prelude::*;
+use tracing::{debug, instrument};
+
+use crate::algo::coord::GeoCoord;
+use crate::algo::wkb::decode_wkb;
+use crate::algo::{
+    AreaKm2, ChannelLengthError, CleanEpsilon, DEFAULT_CLEANING_EPSILON, GeometryRepair,
+    HoleFillMode, PerimeterKm, RasterSource, RefinementError, SnapThreshold, TraversalError,
+    WatershedPerimeterError, WkbDecodeError, WkbEncodeError, collect_upstream,
+    encode_wkb_multi_polygon, geodesic_channel_length, geodesic_perimeter_multi,
+};
+use crate::assembly::{AssemblyOptions, assemble_from_geometries};
+use crate::error::SessionError;
+use crate::reader::catchment_store::CatchmentGeometryQueryError;
+use crate::refinement::{
+    AppliedRefinementProvenance, BestEffortRefinementProvenance, D8RasterRefinementStrategy,
+    D8RefinementPantry, TerminalRefinementDecision, TerminalRefinementError,
+    TerminalRefinementInput, TerminalRefinementStrategy, best_effort_skip_reason,
+};
+use crate::resolver::{
+    OutletResolutionError, ResolutionMethod, ResolverConfig,
+    resolve_outlet_authority_at_level as resolve_outlet_in_resolver_at_level,
+};
+use crate::session::DatasetSession;
+use crate::staged::{
+    DissolvedWatershed, DrainageReach, LevelResolvedOutlet, LevelSelection, PreMergeDrainageUnit,
+    PreMergeDrainageUnits, RefinementMode, SameLevelUpstreamUnits, SelectedLevel,
+    TerminalRefinement, UpstreamReaches,
+};
+use crate::telemetry::{Stage, StageGuard};
+
+// ── RefinementOutcome ─────────────────────────────────────────────────────────
+
+/// Records what happened during the optional terminal-refinement step.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefinementOutcome {
+    /// Refinement ran successfully and the outlet was snapped.
+    Applied {
+        /// The refined outlet coordinate at the selected raster seed cell center.
+        refined_outlet: GeoCoord,
+        /// Provenance explaining why refinement ran.
+        provenance: AppliedRefinementProvenance,
+    },
+    /// Best-effort refinement was visibly skipped.
+    BestEffortSkipped {
+        /// Provenance explaining why refinement was skipped.
+        provenance: BestEffortRefinementProvenance,
+    },
+    /// Refinement was disabled by the caller.
+    Disabled,
+}
+
+// ── DelineationResult ─────────────────────────────────────────────────────────
+
+/// Light drainage-unit metadata retained on a merged delineation result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelineationUnitMetadata {
+    id: UnitId,
+    level: Level,
+    area: hfx::AreaKm2,
+    up_area: Option<hfx::AreaKm2>,
+    outlet: OutletCoord,
+    downstream_id: Option<UnitId>,
+}
+
+impl DelineationUnitMetadata {
+    fn from_pre_merge(unit: &PreMergeDrainageUnit, downstream_id: Option<UnitId>) -> Self {
+        Self {
+            id: unit.id(),
+            level: unit.level(),
+            area: unit.area(),
+            up_area: unit.up_area(),
+            outlet: unit.outlet(),
+            downstream_id,
+        }
+    }
+
+    /// Return the drainage unit ID.
+    pub fn id(&self) -> UnitId {
+        self.id
+    }
+
+    /// Return the HFX level of this drainage unit.
+    pub fn level(&self) -> Level {
+        self.level
+    }
+
+    /// Return the local drainage area from `catchments.parquet`.
+    pub fn area(&self) -> hfx::AreaKm2 {
+        self.area
+    }
+
+    /// Return the total upstream drainage area from `catchments.parquet`, if present.
+    pub fn up_area(&self) -> Option<hfx::AreaKm2> {
+        self.up_area
+    }
+
+    /// Return the declared outlet coordinate for this drainage unit.
+    pub fn outlet(&self) -> OutletCoord {
+        self.outlet
+    }
+
+    /// Return the unit immediately downstream of this one inside the
+    /// delineated watershed, or `None` for the terminal unit.
+    ///
+    /// This is the edge the upstream traversal already walked — see
+    /// [`UpstreamUnits::downstream_of`](crate::algo::UpstreamUnits::downstream_of)
+    /// — not a second graph query. Together, these edges are the drainage tree
+    /// of the watershed, so a caller can derive Strahler order, bifurcation
+    /// ratios, and mainstem paths without re-opening the dataset.
+    pub fn downstream_id(&self) -> Option<UnitId> {
+        self.downstream_id
+    }
+}
+
+/// The output of a successful [`Engine::delineate`] call.
+#[derive(Debug, Clone)]
+pub struct DelineationResult {
+    terminal_unit_id: UnitId,
+    input_outlet: GeoCoord,
+    resolved_outlet: GeoCoord,
+    resolution_method: ResolutionMethod,
+    upstream_unit_ids: Vec<UnitId>,
+    upstream_units: Vec<DelineationUnitMetadata>,
+    refinement: RefinementOutcome,
+    geometry: MultiPolygon<f64>,
+    area_km2: AreaKm2,
+}
+
+impl DelineationResult {
+    /// Return the terminal unit ID that the outlet resolved to.
+    pub fn terminal_unit_id(&self) -> UnitId {
+        self.terminal_unit_id
+    }
+
+    /// Return the original input outlet coordinate.
+    pub fn input_outlet(&self) -> GeoCoord {
+        self.input_outlet
+    }
+
+    /// Return the resolved outlet coordinate (may differ after snapping).
+    pub fn resolved_outlet(&self) -> GeoCoord {
+        self.resolved_outlet
+    }
+
+    /// Return a reference to the resolution provenance.
+    pub fn resolution_method(&self) -> &ResolutionMethod {
+        &self.resolution_method
+    }
+
+    /// Return the slice of all upstream unit IDs (including the terminal).
+    pub fn upstream_unit_ids(&self) -> &[UnitId] {
+        &self.upstream_unit_ids
+    }
+
+    /// Return light metadata for all upstream units, including the terminal.
+    pub fn upstream_units(&self) -> &[DelineationUnitMetadata] {
+        &self.upstream_units
+    }
+
+    /// Return a reference to the refinement outcome.
+    pub fn refinement(&self) -> &RefinementOutcome {
+        &self.refinement
+    }
+
+    /// Return a reference to the assembled watershed geometry.
+    pub fn geometry(&self) -> &MultiPolygon<f64> {
+        &self.geometry
+    }
+
+    /// Return the geodesic watershed area in km².
+    pub fn area_km2(&self) -> AreaKm2 {
+        self.area_km2
+    }
+
+    /// Return the geodesic watershed perimeter in km.
+    ///
+    /// Measures exterior rings only, so a watershed carrying interior holes
+    /// still reports its outer boundary. Paired with
+    /// [`area_km2`](Self::area_km2) on the same WGS84 ellipsoid, this is the
+    /// denominator of the standard shape indices (Gravelius compactness,
+    /// circularity ratio). Computed on demand from the stored geometry; it is
+    /// not cached.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`WatershedPerimeterError::EmptyGeometry`] | The assembled geometry holds no polygons |
+    /// | [`WatershedPerimeterError::NonFinitePerimeter`] | The geodesic sum is not finite |
+    pub fn perimeter_km(&self) -> Result<PerimeterKm, WatershedPerimeterError> {
+        geodesic_perimeter_multi(&self.geometry)
+    }
+
+    /// Consume the result and return the watershed geometry.
+    pub fn into_geometry(self) -> MultiPolygon<f64> {
+        self.geometry
+    }
+
+    /// Encode the watershed geometry to OGC WKB bytes (little-endian, 2D).
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`WkbEncodeError::EncodeFailed`] | The geozero encoder fails |
+    pub fn geometry_wkb(&self) -> Result<Vec<u8>, WkbEncodeError> {
+        encode_wkb_multi_polygon(&self.geometry)
+    }
+}
+
+// ── DelineationAreaOnlyResult ────────────────────────────────────────────────
+
+/// The scalar output of a successful [`Engine::delineate_area_only`] call.
+#[derive(Debug, Clone)]
+pub struct DelineationAreaOnlyResult {
+    terminal_unit_id: UnitId,
+    input_outlet: GeoCoord,
+    resolved_outlet: GeoCoord,
+    resolution_method: ResolutionMethod,
+    upstream_unit_ids: Vec<UnitId>,
+    refinement: RefinementOutcome,
+    area_km2: AreaKm2,
+}
+
+impl DelineationAreaOnlyResult {
+    /// Consume a full delineation result while dropping the watershed geometry.
+    pub fn from_delineation_result(result: DelineationResult) -> Self {
+        Self {
+            terminal_unit_id: result.terminal_unit_id,
+            input_outlet: result.input_outlet,
+            resolved_outlet: result.resolved_outlet,
+            resolution_method: result.resolution_method,
+            upstream_unit_ids: result.upstream_unit_ids,
+            refinement: result.refinement,
+            area_km2: result.area_km2,
+        }
+    }
+
+    /// Return the terminal unit ID that the outlet resolved to.
+    pub fn terminal_unit_id(&self) -> UnitId {
+        self.terminal_unit_id
+    }
+
+    /// Return the original input outlet coordinate.
+    pub fn input_outlet(&self) -> GeoCoord {
+        self.input_outlet
+    }
+
+    /// Return the resolved outlet coordinate (may differ after snapping).
+    pub fn resolved_outlet(&self) -> GeoCoord {
+        self.resolved_outlet
+    }
+
+    /// Return a reference to the resolution provenance.
+    pub fn resolution_method(&self) -> &ResolutionMethod {
+        &self.resolution_method
+    }
+
+    /// Return the slice of all upstream unit IDs (including the terminal).
+    pub fn upstream_unit_ids(&self) -> &[UnitId] {
+        &self.upstream_unit_ids
+    }
+
+    /// Return a reference to the refinement outcome.
+    pub fn refinement(&self) -> &RefinementOutcome {
+        &self.refinement
+    }
+
+    /// Return the geodesic watershed area in km².
+    pub fn area_km2(&self) -> AreaKm2 {
+        self.area_km2
+    }
+}
+
+// ── DelineationOptions ────────────────────────────────────────────────────────
+
+/// Per-call configuration knobs for [`Engine::delineate`].
+#[derive(Debug, Clone)]
+pub struct DelineationOptions {
+    resolver_config: ResolverConfig,
+    snap_threshold: SnapThreshold,
+    hole_fill_mode: HoleFillMode,
+    clean_epsilon: CleanEpsilon,
+    refinement_mode: RefinementMode,
+}
+
+impl Default for DelineationOptions {
+    fn default() -> Self {
+        Self {
+            resolver_config: ResolverConfig::new(),
+            snap_threshold: SnapThreshold::DEFAULT,
+            hole_fill_mode: HoleFillMode::RemoveAll,
+            clean_epsilon: DEFAULT_CLEANING_EPSILON,
+            refinement_mode: RefinementMode::default(),
+        }
+    }
+}
+
+impl DelineationOptions {
+    /// Override the outlet resolver configuration.
+    pub fn with_resolver_config(mut self, config: ResolverConfig) -> Self {
+        self.resolver_config = config;
+        self
+    }
+
+    /// Override the flow-accumulation snap threshold.
+    pub fn with_snap_threshold(mut self, threshold: SnapThreshold) -> Self {
+        self.snap_threshold = threshold;
+        self
+    }
+
+    /// Override the hole-fill strategy applied after geometry assembly.
+    pub fn with_hole_fill_mode(mut self, mode: HoleFillMode) -> Self {
+        self.hole_fill_mode = mode;
+        self
+    }
+
+    /// Override the topology-cleaning epsilon.
+    pub fn with_clean_epsilon(mut self, epsilon: CleanEpsilon) -> Self {
+        self.clean_epsilon = epsilon;
+        self
+    }
+
+    /// Override the terminal-refinement mode.
+    pub fn with_refinement_mode(mut self, mode: RefinementMode) -> Self {
+        self.refinement_mode = mode;
+        self
+    }
+
+    /// Return the configured terminal-refinement mode.
+    pub fn refinement_mode(&self) -> RefinementMode {
+        self.refinement_mode
+    }
+
+    /// Return the configured outlet resolver settings.
+    pub fn resolver_config(&self) -> &ResolverConfig {
+        &self.resolver_config
+    }
+
+    /// Enable or disable the terminal-refinement step.
+    #[deprecated(
+        since = "0.1.123",
+        note = "use with_refinement_mode(RefinementMode::BestEffort) or RefinementMode::Disabled"
+    )]
+    pub fn with_refine(mut self, refine: bool) -> Self {
+        self.refinement_mode = RefinementMode::from(refine);
+        self
+    }
+}
+
+// ── EngineError ───────────────────────────────────────────────────────────────
+
+/// Errors that can occur during [`Engine::delineate`].
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    /// Fired when the outlet coordinate cannot be resolved to an HFX unit.
+    #[error("outlet resolution failed for {outlet}: {source}")]
+    Resolution {
+        /// The outlet coordinate that was supplied.
+        outlet: GeoCoord,
+        /// Underlying resolution error.
+        source: OutletResolutionError,
+    },
+
+    /// Fired when no snap auxiliary is declared for the delineated level.
+    ///
+    /// Reach geometry lives in the `hfx.aux.snap.v2` auxiliary. A dataset that
+    /// declares none can still be delineated; it simply carries no channel
+    /// network, and asking for one is a caller error rather than a silent
+    /// empty result.
+    #[error("no snap auxiliary declared for level {level}; dataset carries no reach geometry")]
+    NoSnapAuxForLevel {
+        /// The HFX level whose snap declaration was sought.
+        level: i16,
+    },
+
+    /// Fired when the snap auxiliary cannot be read for the watershed bbox.
+    #[error("failed to read reach geometry for unit {unit_id}: {source}")]
+    ReachQuery {
+        /// The terminal unit whose watershed was queried.
+        unit_id: i64,
+        /// Underlying session error.
+        source: SessionError,
+    },
+
+    /// Fired when a reach centreline fails WKB decode.
+    #[error("failed to decode reach geometry (snap {snap_id}): {source}")]
+    ReachDecode {
+        /// The snap feature ID whose geometry could not be decoded.
+        snap_id: i64,
+        /// Underlying WKB decode error.
+        source: WkbDecodeError,
+    },
+
+    /// Fired when a decoded reach is not linear or measures non-finite.
+    #[error("failed to measure reach (snap {snap_id}): {source}")]
+    ReachLength {
+        /// The snap feature ID that could not be measured.
+        snap_id: i64,
+        /// Underlying channel-length error.
+        source: ChannelLengthError,
+    },
+
+    /// Fired when the upstream graph traversal fails for the resolved unit.
+    #[error("upstream traversal failed for unit {unit_id}: {source}")]
+    Traversal {
+        /// The raw unit ID that was traversed from.
+        unit_id: i64,
+        /// Underlying traversal error.
+        source: TraversalError,
+    },
+
+    /// Fired when the terminal catchment row cannot be fetched for refinement.
+    #[error("failed to fetch terminal catchment for refinement (unit {unit_id}): {source}")]
+    TerminalCatchmentFetch {
+        /// The raw unit ID whose catchment fetch failed.
+        unit_id: i64,
+        /// Underlying session error.
+        source: SessionError,
+    },
+
+    /// Fired when the stored terminal catchment geometry fails WKB decode.
+    #[error("failed to decode terminal catchment geometry (unit {unit_id}): {source}")]
+    TerminalCatchmentDecode {
+        /// The raw unit ID whose geometry could not be decoded.
+        unit_id: i64,
+        /// Underlying WKB decode error.
+        source: WkbDecodeError,
+    },
+
+    /// Fired when a raster artifact cannot be materialized as a local path.
+    #[error("failed to localize raster for refinement (unit {unit_id}): {source}")]
+    RasterLocalize {
+        /// The raw unit ID for which raster localization was attempted.
+        unit_id: i64,
+        /// Underlying session error.
+        source: SessionError,
+    },
+
+    /// Fired when no unique covering D8 declaration can be selected.
+    #[error("failed to select D8 raster for refinement (unit {unit_id}): {source}")]
+    D8Selection {
+        /// The raw unit ID for which D8 declaration selection was attempted.
+        unit_id: i64,
+        /// Underlying session error.
+        source: SessionError,
+    },
+
+    /// Fired when D8 refinement is required but no raster source is attached.
+    #[error(
+        "required auxiliary schema hfx.aux.d8_raster.v2 selected for unit {unit_id}, but no raster source is attached"
+    )]
+    RequiredD8RasterSourceMissing {
+        /// The raw unit ID for which required D8 refinement was attempted.
+        unit_id: i64,
+    },
+
+    /// Fired when the raster-based terminal refinement step fails.
+    #[error("terminal refinement failed for unit {unit_id}: {source}")]
+    Refinement {
+        /// The raw unit ID for which refinement was attempted.
+        unit_id: i64,
+        /// Underlying refinement error.
+        source: RefinementError,
+    },
+
+    /// Fired when final watershed assembly fails.
+    #[error("watershed assembly failed for unit {unit_id}: {message}")]
+    Assembly {
+        /// The raw unit ID of the terminal unit being assembled.
+        unit_id: i64,
+        /// Human-readable description of the assembly failure.
+        message: String,
+        /// The original assembly error, preserved for error-chain inspection.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Fired when a loaded dataset has no stored session level index entries.
+    ///
+    /// This is unreachable after M2 graph/catchment validation for a valid HFX
+    /// dataset. Treat it as an integrity error if tests can trigger it.
+    #[error(
+        "session level index is empty for loaded dataset {fabric:?} with {unit_count} manifest units"
+    )]
+    SessionLevelIndexEmpty {
+        /// Manifest fabric name for the loaded dataset.
+        fabric: String,
+        /// Manifest unit count for the loaded dataset.
+        unit_count: u64,
+    },
+
+    /// Fired when same-level traversal returns an unit outside the selected level.
+    ///
+    /// M2 graph/catchment validation requires graph edges to stay within one
+    /// level, so this indicates an invalid loaded session or a stale level
+    /// index.
+    #[error("unit {unit_id} is not at selected level {selected_level:?}; found {actual_level:?}")]
+    SameLevelInvariant {
+        /// The raw unit ID whose stored level does not match the selected level.
+        unit_id: i64,
+        /// The selected level required by this staged run.
+        selected_level: hfx::Level,
+        /// The stored level for the unit, if the level index contains it.
+        actual_level: Option<hfx::Level>,
+    },
+
+    /// Fired when pre-merge catchment metadata or geometry cannot be fetched.
+    #[error("failed to fetch pre-merge catchment records for {unit_count} units: {source}")]
+    PreMergeCatchmentFetch {
+        /// Number of unit IDs requested for pre-merge materialization.
+        unit_count: usize,
+        /// Underlying session error.
+        source: SessionError,
+    },
+
+    /// Fired when a pre-merge catchment geometry fails WKB decode.
+    #[error("failed to decode pre-merge catchment geometry (unit {unit_id}): {source}")]
+    PreMergeCatchmentDecode {
+        /// The raw unit ID whose geometry could not be decoded.
+        unit_id: i64,
+        /// Underlying WKB decode error.
+        source: WkbDecodeError,
+    },
+}
+
+// ── EngineBuilder ─────────────────────────────────────────────────────────────
+
+/// Builder for [`Engine`].
+pub struct EngineBuilder {
+    session: DatasetSession,
+    raster_source: Option<Box<dyn RasterSource + Send + Sync>>,
+    refinement_strategy: Option<Box<dyn TerminalRefinementStrategy + Send + Sync>>,
+    geometry_repair: Option<Box<dyn GeometryRepair + Send + Sync>>,
+}
+
+impl EngineBuilder {
+    /// Attach a [`RasterSource`] backend for terminal refinement.
+    pub fn with_raster_source(mut self, source: impl RasterSource + Send + Sync + 'static) -> Self {
+        self.raster_source = Some(Box::new(source));
+        self
+    }
+
+    /// Attach a terminal-refinement strategy.
+    pub fn with_refinement_strategy(
+        mut self,
+        strategy: impl TerminalRefinementStrategy + 'static,
+    ) -> Self {
+        self.refinement_strategy = Some(Box::new(strategy));
+        self
+    }
+
+    /// Attach a [`GeometryRepair`] backend for post-assembly topology repair.
+    pub fn with_geometry_repair(
+        mut self,
+        repairer: impl GeometryRepair + Send + Sync + 'static,
+    ) -> Self {
+        self.geometry_repair = Some(Box::new(repairer));
+        self
+    }
+
+    /// Consume the builder and return a ready-to-use [`Engine`].
+    pub fn build(self) -> Engine {
+        Engine {
+            session: self.session,
+            raster_source: self.raster_source,
+            refinement_strategy: self
+                .refinement_strategy
+                .unwrap_or_else(|| Box::new(D8RasterRefinementStrategy)),
+            geometry_repair: self.geometry_repair,
+        }
+    }
+}
+
+// ── Engine ────────────────────────────────────────────────────────────────────
+
+/// The pourpoint watershed delineation engine.
+///
+/// Wires outlet resolution, upstream traversal, optional terminal refinement,
+/// and watershed assembly into a single [`Engine::delineate`] call.
+pub struct Engine {
+    session: DatasetSession,
+    raster_source: Option<Box<dyn RasterSource + Send + Sync>>,
+    refinement_strategy: Box<dyn TerminalRefinementStrategy + Send + Sync>,
+    geometry_repair: Option<Box<dyn GeometryRepair + Send + Sync>>,
+}
+
+impl Engine {
+    /// Return a builder for constructing an [`Engine`] from a [`DatasetSession`].
+    pub fn builder(session: DatasetSession) -> EngineBuilder {
+        EngineBuilder {
+            session,
+            raster_source: None,
+            refinement_strategy: None,
+            geometry_repair: None,
+        }
+    }
+
+    /// Return object-store request counters when network benchmarking is enabled.
+    pub fn http_stats(&self) -> Option<crate::source_telemetry::HttpStatsSnapshot> {
+        self.session.http_stats()
+    }
+
+    /// Select the HFX drainage-unit level for a staged delineation run.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`EngineError::SessionLevelIndexEmpty`] | The loaded session has no stored level-index entries |
+    pub fn select_level(&self, choice: LevelSelection) -> Result<SelectedLevel, EngineError> {
+        match choice {
+            LevelSelection::Finest => self
+                .session
+                .max_level()
+                .map(SelectedLevel::from_proven_level)
+                .ok_or_else(|| EngineError::SessionLevelIndexEmpty {
+                    fabric: self.session.manifest().fabric_name().to_string(),
+                    unit_count: self.session.manifest().unit_count().get(),
+                }),
+        }
+    }
+
+    /// Resolve an outlet within a selected HFX drainage-unit level.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`EngineError::Resolution`] | Outlet cannot be resolved to an unit |
+    pub fn resolve_outlet_at_level(
+        &self,
+        outlet: GeoCoord,
+        selected_level: SelectedLevel,
+        config: &ResolverConfig,
+    ) -> Result<LevelResolvedOutlet, EngineError> {
+        resolve_outlet_in_resolver_at_level(&self.session, outlet, selected_level, config)
+            .map(|resolved| LevelResolvedOutlet::new(selected_level, resolved))
+            .map_err(|source| EngineError::Resolution { outlet, source })
+    }
+
+    /// Traverse the same-level upstream graph for a level-resolved outlet.
+    ///
+    /// This stage is a thin topology wrapper around [`collect_upstream`]. It
+    /// adds the terminal and selected-level tags, and validates that every
+    /// traversed unit belongs to the selected level already proven by the
+    /// session level index.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`EngineError::Traversal`] | Upstream graph traversal fails |
+    /// | [`EngineError::SameLevelInvariant`] | A traversed unit is absent from or outside the selected level |
+    pub fn traverse_upstream_at_level(
+        &self,
+        outlet: &LevelResolvedOutlet,
+    ) -> Result<SameLevelUpstreamUnits, EngineError> {
+        let terminal = outlet.authority().unit_id();
+        let selected_level = outlet.selected_level();
+        let upstream = collect_upstream(terminal, self.session.graph()).map_err(|source| {
+            EngineError::Traversal {
+                unit_id: terminal.get(),
+                source,
+            }
+        })?;
+
+        for unit_id in upstream.iter().copied() {
+            let actual_level = self.session.level_of(unit_id);
+            if actual_level != Some(selected_level.level()) {
+                return Err(EngineError::SameLevelInvariant {
+                    unit_id: unit_id.get(),
+                    selected_level: selected_level.level(),
+                    actual_level,
+                });
+            }
+        }
+
+        Ok(SameLevelUpstreamUnits::new(
+            terminal,
+            selected_level,
+            upstream,
+        ))
+    }
+
+    /// Materialize pristine pre-merge drainage-unit records.
+    ///
+    /// Metadata is fetched via `query_by_ids`; decoded geometries are fetched
+    /// separately via `query_geometries_by_ids`, preserving the instrumented
+    /// geometry-decode path used by assembly and refinement.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`EngineError::PreMergeCatchmentFetch`] | Metadata or geometry rows cannot be read, or a requested row is missing |
+    /// | [`EngineError::PreMergeCatchmentDecode`] | A requested geometry fails WKB decode |
+    /// | [`EngineError::SameLevelInvariant`] | A materialized record is outside the selected level |
+    pub fn produce_pre_merge_units(
+        &self,
+        upstream: &SameLevelUpstreamUnits,
+    ) -> Result<PreMergeDrainageUnits, EngineError> {
+        let ids = upstream.upstream().unit_ids();
+        let metadata_by_id = self
+            .session
+            .catchments()
+            .query_by_ids(ids)
+            .map_err(|source| EngineError::PreMergeCatchmentFetch {
+                unit_count: ids.len(),
+                source,
+            })?
+            .into_iter()
+            .map(|unit| (unit.id(), unit))
+            .collect::<HashMap<_, _>>();
+
+        let mut geometry_by_id = self
+            .session
+            .catchments()
+            .query_geometries_by_ids(ids)
+            .map_err(|source| match source {
+                CatchmentGeometryQueryError::Read { source } => {
+                    EngineError::PreMergeCatchmentFetch {
+                        unit_count: ids.len(),
+                        source,
+                    }
+                }
+                CatchmentGeometryQueryError::Decode { unit_id, source } => {
+                    EngineError::PreMergeCatchmentDecode {
+                        unit_id: unit_id.get(),
+                        source,
+                    }
+                }
+            })?
+            .into_iter()
+            .map(|row| row.into_parts())
+            .collect::<HashMap<_, _>>();
+
+        let mut units = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let metadata =
+                metadata_by_id
+                    .get(&id)
+                    .ok_or_else(|| EngineError::PreMergeCatchmentFetch {
+                        unit_count: ids.len(),
+                        source: SessionError::integrity(format!(
+                            "pre-merge unit {} not in catchment store metadata",
+                            id.get()
+                        )),
+                    })?;
+            if metadata.level() != upstream.selected_level().level() {
+                return Err(EngineError::SameLevelInvariant {
+                    unit_id: id.get(),
+                    selected_level: upstream.selected_level().level(),
+                    actual_level: Some(metadata.level()),
+                });
+            }
+            let geometry =
+                geometry_by_id
+                    .remove(&id)
+                    .ok_or_else(|| EngineError::PreMergeCatchmentFetch {
+                        unit_count: ids.len(),
+                        source: SessionError::integrity(format!(
+                            "pre-merge unit {} not in catchment store geometry rows",
+                            id.get()
+                        )),
+                    })?;
+
+            units.push(PreMergeDrainageUnit::new(
+                id,
+                metadata.level(),
+                metadata.area(),
+                metadata.upstream_area(),
+                metadata.outlet(),
+                geometry,
+            ));
+        }
+
+        Ok(PreMergeDrainageUnits::new(
+            upstream.terminal(),
+            upstream.selected_level(),
+            units,
+        ))
+    }
+
+    /// Materialize the channel network of the delineated watershed.
+    ///
+    /// Reach centrelines live in the `hfx.aux.snap.v2` auxiliary that outlet
+    /// resolution already reads. This stage re-reads them for the whole basin
+    /// rather than the outlet neighbourhood: the snap store is queried by the
+    /// bounding rectangle of the pre-merge units, then narrowed to reaches
+    /// whose `unit_id` is in the delineated set, so linework belonging to
+    /// neighbouring basins inside the same rectangle is discarded.
+    ///
+    /// The returned lengths are geodesic on WGS84, matching
+    /// [`DelineationResult::area_km2`], so `total_length / area` is drainage
+    /// density measured consistently on both terms.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`EngineError::NoSnapAuxForLevel`] | The dataset declares no snap auxiliary for the delineated level |
+    /// | [`EngineError::ReachQuery`] | The snap auxiliary cannot be read |
+    /// | [`EngineError::ReachDecode`] | A reach centreline fails WKB decode |
+    /// | [`EngineError::ReachLength`] | A decoded reach is not linear, or measures non-finite |
+    #[instrument(skip(self, units), fields(terminal = units.terminal().get()))]
+    pub fn upstream_reaches(
+        &self,
+        units: &PreMergeDrainageUnits,
+    ) -> Result<UpstreamReaches, EngineError> {
+        let _guard = StageGuard::enter(Stage::UpstreamTraversal);
+        let terminal = units.terminal();
+        let selected_level = units.selected_level();
+
+        let store = self.session.snap_for_level(selected_level.level()).ok_or(
+            EngineError::NoSnapAuxForLevel {
+                level: selected_level.level().get(),
+            },
+        )?;
+
+        let Some(query_bbox) = watershed_bbox(units)? else {
+            return Ok(UpstreamReaches::new(terminal, selected_level, Vec::new()));
+        };
+
+        let member_ids: HashSet<UnitId> = units.units().iter().map(|unit| unit.id()).collect();
+
+        let targets =
+            store
+                .query_by_bbox(&query_bbox)
+                .map_err(|source| EngineError::ReachQuery {
+                    unit_id: terminal.get(),
+                    source,
+                })?;
+
+        let mut reaches = Vec::new();
+        for target in targets {
+            if !member_ids.contains(&target.unit_id()) {
+                continue;
+            }
+            let geometry =
+                decode_wkb(target.geometry()).map_err(|source| EngineError::ReachDecode {
+                    snap_id: target.id().get(),
+                    source,
+                })?;
+            let length =
+                geodesic_channel_length(&geometry).map_err(|source| EngineError::ReachLength {
+                    snap_id: target.id().get(),
+                    source,
+                })?;
+            reaches.push(DrainageReach::new(
+                target.id(),
+                target.unit_id(),
+                target.stem_role(),
+                target.weight(),
+                length,
+                geometry,
+                target.geometry().as_bytes().to_vec(),
+            ));
+        }
+
+        debug!(
+            reach_count = reaches.len(),
+            unit_count = units.units().len(),
+            "materialized watershed channel network"
+        );
+
+        Ok(UpstreamReaches::new(terminal, selected_level, reaches))
+    }
+
+    /// Attempt terminal refinement using the pre-merge terminal geometry.
+    ///
+    /// This stage preserves the current best-effort raster refinement behavior
+    /// while avoiding a second terminal catchment geometry query after
+    /// [`Engine::produce_pre_merge_units`] has already decoded it.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`EngineError::PreMergeCatchmentFetch`] | The pre-merge collection does not contain its terminal record |
+    /// | [`EngineError::RasterLocalize`] | Remote rasters cannot be materialized locally |
+    /// | [`EngineError::Refinement`] | Raster seed selection or the terminal geometry fails |
+    pub fn refine_terminal(
+        &self,
+        resolved: &LevelResolvedOutlet,
+        units: &PreMergeDrainageUnits,
+        options: &DelineationOptions,
+    ) -> Result<TerminalRefinement, EngineError> {
+        let terminal = units.terminal();
+        match options.refinement_mode {
+            RefinementMode::Disabled => return Ok(TerminalRefinement::Disabled),
+            RefinementMode::BestEffort if !self.session.has_d8_aux() => {
+                if let Some(schema) = self.session.first_unreadable_d8_auxiliary_schema() {
+                    return Ok(TerminalRefinement::best_effort_unreadable_d8_aux_declared(
+                        schema.to_owned(),
+                    ));
+                }
+                return Ok(match resolved.authority() {
+                    crate::resolver::OutletResolution::VectorPoint { .. } => {
+                        TerminalRefinement::best_effort_no_d8_aux_declared()
+                    }
+                    crate::resolver::OutletResolution::UnitContainment { .. } => {
+                        TerminalRefinement::best_effort_coarse_unit_only_no_d8_aux_declared()
+                    }
+                });
+            }
+            RefinementMode::RequireD8 if !self.session.has_d8_aux() => {
+                return Err(EngineError::D8Selection {
+                    unit_id: terminal.get(),
+                    source: SessionError::MissingRequiredD8Aux,
+                });
+            }
+            RefinementMode::BestEffort | RefinementMode::RequireD8 => {}
+        }
+
+        let terminal_polygon = units
+            .terminal_unit()
+            .filter(|unit| unit.id() == terminal)
+            .ok_or_else(|| EngineError::PreMergeCatchmentFetch {
+                unit_count: units.units().len(),
+                source: SessionError::integrity(format!(
+                    "terminal unit {} not in pre-merge units",
+                    terminal.get()
+                )),
+            })?
+            .geometry();
+        let input = TerminalRefinementInput {
+            terminal_unit: terminal,
+            terminal_geometry: terminal_polygon,
+            outlet_authority: resolved.authority().into(),
+            snap_threshold: options.snap_threshold,
+        };
+        let pantry = D8RefinementPantry {
+            session: &self.session,
+            raster_source: self.raster_source.as_deref(),
+        };
+
+        let decision = match self.refinement_strategy.refine_terminal(input, &pantry) {
+            Ok(decision) => decision,
+            Err(error) => match options.refinement_mode {
+                RefinementMode::BestEffort => {
+                    let reason = best_effort_skip_reason(&error);
+                    if let crate::refinement::BestEffortSkipReason::VectorOutletGuardFailed {
+                        kind,
+                        requested_threshold,
+                        effective_threshold,
+                        units,
+                        mapped_cell,
+                        measured_accumulation,
+                    } = &reason
+                    {
+                        let vector_coord = resolved.authority().resolved_coord();
+                        tracing::warn!(
+                            unit_id = terminal.get(),
+                            vector_lon = vector_coord.lon,
+                            vector_lat = vector_coord.lat,
+                            failure_kind = ?kind,
+                            requested_threshold_cells = requested_threshold.pixels(),
+                            effective_threshold = *effective_threshold,
+                            accumulation_units = %units,
+                            mapped_row = mapped_cell.map(|cell| cell.row),
+                            mapped_col = mapped_cell.map(|cell| cell.col),
+                            measured_accumulation = *measured_accumulation,
+                            "retaining coarse terminal after vector outlet cell guard failure"
+                        );
+                    }
+                    return Ok(TerminalRefinement::best_effort_skipped(reason));
+                }
+                RefinementMode::RequireD8 => return Err(EngineError::from(error)),
+                RefinementMode::Disabled => return Ok(TerminalRefinement::Disabled),
+            },
+        };
+        terminal_refinement_from_decision(decision, options.refinement_mode, terminal)
+    }
+
+    /// Compatibility shim for the former provisional staging method name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Engine::refine_terminal`].
+    #[deprecated(note = "use Engine::refine_terminal")]
+    pub fn refine_terminal_placeholder(
+        &self,
+        resolved: &LevelResolvedOutlet,
+        units: &PreMergeDrainageUnits,
+        options: &DelineationOptions,
+    ) -> Result<TerminalRefinement, EngineError> {
+        self.refine_terminal(resolved, units, options)
+    }
+
+    /// Dissolve pre-merge drainage-unit geometries into the final watershed.
+    ///
+    /// When terminal refinement supplies an applied override, the whole
+    /// terminal polygon is excluded and replaced by the refined terminal
+    /// geometry before calling the geometry-only assembly path.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`EngineError::Assembly`] | Watershed geometry assembly fails |
+    pub fn dissolve_watershed(
+        &self,
+        units: &PreMergeDrainageUnits,
+        refinement: &TerminalRefinement,
+        options: &DelineationOptions,
+    ) -> Result<DissolvedWatershed, EngineError> {
+        let terminal = units.terminal();
+        let refined_terminal_geometry = match refinement {
+            TerminalRefinement::Applied { geometry, .. } => Some(geometry.polygon()),
+            TerminalRefinement::Disabled | TerminalRefinement::BestEffortSkipped { .. } => None,
+        };
+
+        let mut geometries_by_id = std::collections::BTreeMap::new();
+        for unit in units.units() {
+            if unit.id() == terminal && refined_terminal_geometry.is_some() {
+                continue;
+            }
+            geometries_by_id.insert(unit.id(), unit.geometry().clone());
+        }
+        if let Some(geometry) = refined_terminal_geometry {
+            geometries_by_id.insert(terminal, geometry.clone());
+        }
+
+        let mut geometries = Vec::with_capacity(geometries_by_id.len());
+        for (unit_id, geometry) in geometries_by_id {
+            if unit_id == terminal && refined_terminal_geometry.is_some() {
+                if geometry.0.is_empty() {
+                    let error =
+                        crate::assembly::AssemblyError::EmptyRefinedTerminalGeometry { unit_id };
+                    return Err(EngineError::Assembly {
+                        unit_id: terminal.get(),
+                        message: error.to_string(),
+                        source: Box::new(error),
+                    });
+                }
+            } else if geometry.0.is_empty() {
+                let error = crate::assembly::AssemblyError::EmptyCatchmentGeometry { unit_id };
+                return Err(EngineError::Assembly {
+                    unit_id: terminal.get(),
+                    message: error.to_string(),
+                    source: Box::new(error),
+                });
+            }
+            geometries.push(geometry);
+        }
+
+        let assembly_options = self.build_assembly_options(options);
+        let result = assemble_from_geometries(geometries, assembly_options).map_err(|e| {
+            EngineError::Assembly {
+                unit_id: terminal.get(),
+                message: e.to_string(),
+                source: Box::new(e),
+            }
+        })?;
+        let (geometry, area_km2) = result.into_parts();
+        Ok(DissolvedWatershed::new(geometry, area_km2))
+    }
+
+    /// Compose the public delineation result from completed staged outputs.
+    pub fn compose_result(
+        &self,
+        resolved: LevelResolvedOutlet,
+        upstream: SameLevelUpstreamUnits,
+        units: &PreMergeDrainageUnits,
+        refinement: TerminalRefinement,
+        dissolved: DissolvedWatershed,
+    ) -> DelineationResult {
+        DelineationResult {
+            terminal_unit_id: resolved.authority().unit_id(),
+            input_outlet: resolved.authority().input_coord(),
+            resolved_outlet: resolved.authority().resolved_coord(),
+            resolution_method: resolved.authority().method(),
+            upstream_unit_ids: upstream.upstream().unit_ids().to_vec(),
+            upstream_units: units
+                .units()
+                .iter()
+                .map(|unit| {
+                    DelineationUnitMetadata::from_pre_merge(
+                        unit,
+                        upstream.upstream().downstream_of(unit.id()),
+                    )
+                })
+                .collect(),
+            refinement: refinement_outcome_from_terminal(&refinement),
+            geometry: dissolved.geometry().clone(),
+            area_km2: dissolved.area_km2(),
+        }
+    }
+
+    /// Delineate the watershed upstream of `outlet`.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`EngineError::Resolution`] | Outlet cannot be resolved to an unit |
+    /// | [`EngineError::Traversal`] | Upstream graph traversal fails |
+    /// | [`EngineError::TerminalCatchmentFetch`] | Terminal catchment row is missing (refinement only) |
+    /// | [`EngineError::TerminalCatchmentDecode`] | Terminal catchment WKB is invalid (refinement only) |
+    /// | [`EngineError::RasterLocalize`] | Remote rasters cannot be materialized locally (refinement only) |
+    /// | [`EngineError::Refinement`] | Raster seed selection or carve fails (refinement only) |
+    /// | [`EngineError::Assembly`] | Watershed geometry assembly fails |
+    #[instrument(skip(self, options), fields(outlet = %outlet))]
+    pub fn delineate(
+        &self,
+        outlet: GeoCoord,
+        options: &DelineationOptions,
+    ) -> Result<DelineationResult, EngineError> {
+        // Step 1: Select finest level and resolve outlet within that level.
+        let level_resolved = {
+            let _guard = StageGuard::enter(Stage::OutletResolve);
+            let selected_level = self.select_level(LevelSelection::Finest)?;
+            self.resolve_outlet_at_level(outlet, selected_level, &options.resolver_config)?
+        };
+
+        // Step 2: Upstream traversal
+        let same_level_upstream = {
+            let _guard = StageGuard::enter(Stage::UpstreamTraversal);
+            self.traverse_upstream_at_level(&level_resolved)?
+        };
+
+        let pre_merge = self.produce_pre_merge_units(&same_level_upstream)?;
+
+        // Step 3: Try refinement
+        let terminal_refinement = self.refine_terminal(&level_resolved, &pre_merge, options)?;
+
+        // Step 4: Assembly
+        let dissolved = {
+            let _guard = StageGuard::enter(Stage::WatershedAssembly);
+            self.dissolve_watershed(&pre_merge, &terminal_refinement, options)?
+        };
+
+        // Step 5: Compose result
+        let result = {
+            let _guard = StageGuard::enter(Stage::ResultCompose);
+            self.compose_result(
+                level_resolved,
+                same_level_upstream,
+                &pre_merge,
+                terminal_refinement,
+                dissolved,
+            )
+        };
+        Ok(result)
+    }
+
+    /// Delineate the watershed upstream of `outlet` and return scalar metadata only.
+    ///
+    /// This conservative implementation reuses [`Engine::delineate`] for the
+    /// hydrologic work, then drops the assembled geometry before returning.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`EngineError::Resolution`] | Outlet cannot be resolved to an unit |
+    /// | [`EngineError::Traversal`] | Upstream graph traversal fails |
+    /// | [`EngineError::TerminalCatchmentFetch`] | Terminal catchment row is missing (refinement only) |
+    /// | [`EngineError::TerminalCatchmentDecode`] | Terminal catchment WKB is invalid (refinement only) |
+    /// | [`EngineError::RasterLocalize`] | Remote rasters cannot be materialized locally (refinement only) |
+    /// | [`EngineError::Refinement`] | Raster seed selection or carve fails (refinement only) |
+    /// | [`EngineError::Assembly`] | Watershed geometry assembly fails |
+    #[instrument(skip(self, options), fields(outlet = %outlet))]
+    pub fn delineate_area_only(
+        &self,
+        outlet: GeoCoord,
+        options: &DelineationOptions,
+    ) -> Result<DelineationAreaOnlyResult, EngineError> {
+        self.delineate(outlet, options)
+            .map(DelineationAreaOnlyResult::from_delineation_result)
+    }
+
+    /// Delineate watersheds for a heterogeneous batch of (outlet, options) pairs.
+    ///
+    /// Results are returned in input order. Each element is the `Result` of the
+    /// corresponding call — failures do not abort the batch.
+    pub fn delineate_batch(
+        &self,
+        outlets: &[(GeoCoord, DelineationOptions)],
+    ) -> Vec<Result<DelineationResult, EngineError>> {
+        outlets
+            .par_iter()
+            .map(|(outlet, opts)| self.delineate(*outlet, opts))
+            .collect()
+    }
+
+    /// Delineate watersheds for a slice of outlets sharing the same options.
+    ///
+    /// Results are returned in input order. Each element is the `Result` of the
+    /// corresponding call — failures do not abort the batch.
+    pub fn delineate_batch_uniform(
+        &self,
+        outlets: &[GeoCoord],
+        options: &DelineationOptions,
+    ) -> Vec<Result<DelineationResult, EngineError>> {
+        outlets
+            .par_iter()
+            .map(|outlet| self.delineate(*outlet, options))
+            .collect()
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Construct [`AssemblyOptions`] from per-call settings and the engine's
+    /// optional geometry-repair backend.
+    fn build_assembly_options<'a>(&'a self, options: &DelineationOptions) -> AssemblyOptions<'a> {
+        let base = AssemblyOptions::new(options.hole_fill_mode, options.clean_epsilon);
+        match self.geometry_repair.as_deref() {
+            Some(repairer) => base.with_geometry_repair(repairer),
+            None => base,
+        }
+    }
+}
+
+fn refinement_outcome_from_terminal(refinement: &TerminalRefinement) -> RefinementOutcome {
+    match refinement {
+        TerminalRefinement::Applied {
+            refined_outlet,
+            provenance,
+            ..
+        } => RefinementOutcome::Applied {
+            refined_outlet: *refined_outlet,
+            provenance: provenance.clone(),
+        },
+        TerminalRefinement::BestEffortSkipped { provenance } => {
+            RefinementOutcome::BestEffortSkipped {
+                provenance: provenance.clone(),
+            }
+        }
+        TerminalRefinement::Disabled => RefinementOutcome::Disabled,
+    }
+}
+
+fn terminal_refinement_from_decision(
+    decision: TerminalRefinementDecision,
+    mode: RefinementMode,
+    terminal: UnitId,
+) -> Result<TerminalRefinement, EngineError> {
+    match decision {
+        TerminalRefinementDecision::Applied {
+            refined_outlet,
+            geometry,
+            provenance,
+        } => Ok(TerminalRefinement::Applied {
+            refined_outlet,
+            geometry,
+            provenance,
+        }),
+        TerminalRefinementDecision::BestEffortSkipped { provenance } => match mode {
+            RefinementMode::BestEffort => Ok(TerminalRefinement::BestEffortSkipped { provenance }),
+            RefinementMode::RequireD8 => Err(EngineError::RequiredD8RasterSourceMissing {
+                unit_id: terminal.get(),
+            }),
+            RefinementMode::Disabled => Ok(TerminalRefinement::Disabled),
+        },
+    }
+}
+
+impl From<TerminalRefinementError> for EngineError {
+    fn from(source: TerminalRefinementError) -> Self {
+        match source {
+            TerminalRefinementError::EmptyContainedTerminalGeometry => EngineError::Refinement {
+                unit_id: 0,
+                source: RefinementError::EmptyPolygonization,
+            },
+            TerminalRefinementError::RasterSource { unit_id, .. } => {
+                EngineError::RequiredD8RasterSourceMissing { unit_id }
+            }
+            TerminalRefinementError::D8Selection { unit_id, source } => {
+                EngineError::D8Selection { unit_id, source }
+            }
+            TerminalRefinementError::RasterLocalize {
+                unit_id, source, ..
+            } => EngineError::RasterLocalize { unit_id, source },
+            TerminalRefinementError::Algorithm { unit_id, source } => {
+                EngineError::Refinement { unit_id, source }
+            }
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use geo::{BoundingRect, Rect};
+    use hfx::{FlowAccumulationUnits, FlowDirEncoding};
+    use object_store::path::Path as ObjectPath;
+
+    use super::*;
+    use crate::algo::{
+        AccumulationTile, FlowDirectionTile, GeoTransform, GridCoord, GridDims, NativeCoord,
+        ProjectionError, RasterSourceError, RasterTile, RasterTileError, Raw, SnapError,
+    };
+    use crate::error::CacheError;
+    use crate::reader::test_instrumentation::ReaderSessionMeasurementScope;
+    use crate::refinement::{BestEffortSkipReason, BestEffortSkipSource, RefinementStrategyName};
+    use crate::session::{DatasetSession, RasterKind};
+    use crate::testutil::{DatasetBuilder, TestCatchment};
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Build a 3-unit linear dataset and open a session.
+    ///
+    /// Graph: 1 -> 2 -> 3 (unit 3 is the terminal / outlet unit).
+    /// Default catchment bboxes (from DatasetBuilder):
+    ///   unit 1: (0.50, 0.00, 0.90, 0.40)
+    ///   unit 2: (1.00, 0.00, 1.40, 0.40)
+    ///   unit 3: (1.50, 0.00, 1.90, 0.40)
+    fn three_unit_session() -> (tempfile::TempDir, DatasetSession) {
+        let (dir, root) = DatasetBuilder::new(3).build();
+        let session = DatasetSession::open_path(&root).expect("session should open");
+        (dir, session)
+    }
+
+    /// Coordinate inside unit 3's bbox — (1.70, 0.20).
+    fn coord_in_unit3() -> GeoCoord {
+        GeoCoord::new(1.70, 0.20)
+    }
+
+    /// Coordinate far outside any catchment.
+    fn coord_outside() -> GeoCoord {
+        GeoCoord::new(999.0, 999.0)
+    }
+
+    fn test_raster_geo() -> GeoTransform {
+        GeoTransform::new(NativeCoord::new(0.0, 0.0), 1.0, -1.0)
+    }
+
+    fn make_flow_tile(values: &[u8], encoding: FlowDirEncoding) -> FlowDirectionTile<Raw> {
+        let dims = GridDims::new(5, 5);
+        let mut tile = FlowDirectionTile::new(dims, test_raster_geo(), encoding)
+            .expect("flow direction tile should build");
+        for row in 0..5 {
+            for col in 0..5 {
+                tile.set_raw(GridCoord::new(row, col), values[row * 5 + col]);
+            }
+        }
+        tile
+    }
+
+    fn make_accumulation_tile(values: &[f32]) -> AccumulationTile<Raw> {
+        let dims = GridDims::new(5, 5);
+        let raw = RasterTile::from_vec(values.to_vec(), dims, f32::NAN, test_raster_geo())
+            .expect("accumulation tile should build");
+        AccumulationTile::from_raw(raw)
+    }
+
+    struct AppliedRefinementRasterSource;
+    struct OutletBoundaryTieRasterSource;
+
+    impl RasterSource for AppliedRefinementRasterSource {
+        fn load_flow_direction(
+            &self,
+            _uri: &str,
+            _bbox: &Rect<f64>,
+            encoding: FlowDirEncoding,
+        ) -> Result<FlowDirectionTile<Raw>, RasterSourceError> {
+            #[rustfmt::skip]
+            let values = [
+                2, 4, 4, 4, 8,
+                1, 2, 4, 8, 16,
+                1, 1, 4, 16, 16,
+                0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0,
+            ];
+            Ok(make_flow_tile(&values, encoding))
+        }
+
+        fn load_accumulation(
+            &self,
+            _uri: &str,
+            _bbox: &Rect<f64>,
+        ) -> Result<AccumulationTile<Raw>, RasterSourceError> {
+            let mut values = [1.0_f32; 25];
+            values[2 * 5 + 2] = 800.0;
+            Ok(make_accumulation_tile(&values))
+        }
+    }
+
+    impl RasterSource for OutletBoundaryTieRasterSource {
+        fn load_flow_direction(
+            &self,
+            _uri: &str,
+            _bbox: &Rect<f64>,
+            encoding: FlowDirEncoding,
+        ) -> Result<FlowDirectionTile<Raw>, RasterSourceError> {
+            #[rustfmt::skip]
+            let values = [
+                0, 0, 0, 0, 0,
+                0, 4, 4, 0, 0,
+                0, 16, 4, 0, 0,
+                0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0,
+            ];
+            Ok(make_flow_tile(&values, encoding))
+        }
+
+        fn load_accumulation(
+            &self,
+            _uri: &str,
+            _bbox: &Rect<f64>,
+        ) -> Result<AccumulationTile<Raw>, RasterSourceError> {
+            let mut values = [1.0_f32; 25];
+            values[2 * 5 + 1] = 900.0;
+            values[2 * 5 + 2] = 800.0;
+            Ok(make_accumulation_tile(&values))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum VectorGuardFixture {
+        BelowThreshold,
+        UndefinedAccumulation,
+        OutsideTerminalMask,
+        UndefinedFlowDirection,
+        GrassTerminalZero,
+        GrassSignedExit,
+        OutsideRasterWindow,
+    }
+
+    impl RasterSource for VectorGuardFixture {
+        fn load_flow_direction(
+            &self,
+            _uri: &str,
+            _bbox: &Rect<f64>,
+            encoding: FlowDirEncoding,
+        ) -> Result<FlowDirectionTile<Raw>, RasterSourceError> {
+            let mut values = [0_u8; 25];
+            values[2 * 5 + 1] = 4;
+            values[2 * 5 + 2] = match self {
+                Self::UndefinedFlowDirection | Self::GrassTerminalZero => 0,
+                Self::GrassSignedExit => (-2_i8) as u8,
+                _ => 4,
+            };
+            values[2 * 5 + 4] = 4;
+            if matches!(self, Self::GrassSignedExit) {
+                let raw = RasterTile::from_vec(
+                    values.to_vec(),
+                    GridDims::new(5, 5),
+                    (-128_i8) as u8,
+                    test_raster_geo(),
+                )
+                .expect("signed GRASS fixture tile should construct");
+                return FlowDirectionTile::from_raw(raw, encoding).map_err(RasterSourceError::from);
+            }
+            Ok(make_flow_tile(&values, encoding))
+        }
+
+        fn load_accumulation(
+            &self,
+            _uri: &str,
+            _bbox: &Rect<f64>,
+        ) -> Result<AccumulationTile<Raw>, RasterSourceError> {
+            let mut values = [1.0_f32; 25];
+            values[2 * 5 + 1] = 900.0;
+            values[2 * 5 + 2] = match self {
+                Self::BelowThreshold => 100.0,
+                Self::UndefinedAccumulation => f32::NAN,
+                _ => 800.0,
+            };
+            values[2 * 5 + 4] = 800.0;
+            Ok(make_accumulation_tile(&values))
+        }
+    }
+
+    // ── engine_single_outlet_no_rasters ──────────────────────────────────────
+
+    #[test]
+    fn engine_single_outlet_no_rasters() {
+        let (_dir, session) = three_unit_session();
+        let engine = Engine::builder(session).build();
+
+        let result = engine
+            .delineate(coord_in_unit3(), &DelineationOptions::default())
+            .expect("delineation should succeed");
+
+        assert!(result.area_km2().as_f64() > 0.0, "area must be positive");
+        assert!(
+            !result.geometry().0.is_empty(),
+            "geometry must have at least one polygon"
+        );
+        assert_eq!(
+            result.refinement(),
+            &RefinementOutcome::BestEffortSkipped {
+                provenance: BestEffortRefinementProvenance::new(
+                    RefinementStrategyName::BestEffortD8IfPresent,
+                    crate::refinement::BestEffortSkipReason::CoarseUnitOnlyNoD8AuxDeclared
+                ),
+            },
+            "no D8 aux registered -> visible best-effort skip"
+        );
+        assert!(
+            !result.upstream_unit_ids().is_empty(),
+            "at least one unit in upstream"
+        );
+    }
+
+    #[test]
+    fn merged_result_retains_light_upstream_unit_metadata() {
+        let (_dir, root) = DatasetBuilder::new(3)
+            .with_custom_catchments(vec![
+                TestCatchment {
+                    id: 1,
+                    area_km2: 11.0,
+                    up_area_km2: Some(11.0),
+                    polygon: (0.5, 0.0, 0.9, 0.4),
+                },
+                TestCatchment {
+                    id: 2,
+                    area_km2: 22.0,
+                    up_area_km2: Some(33.0),
+                    polygon: (1.0, 0.0, 1.4, 0.4),
+                },
+                TestCatchment {
+                    id: 3,
+                    area_km2: 33.0,
+                    up_area_km2: Some(66.0),
+                    polygon: (1.5, 0.0, 1.9, 0.4),
+                },
+            ])
+            .build();
+        let session = DatasetSession::open_path(&root).expect("session should open");
+        let engine = Engine::builder(session).build();
+
+        let result = engine
+            .delineate(coord_in_unit3(), &DelineationOptions::default())
+            .expect("delineation should succeed");
+
+        assert_eq!(result.upstream_unit_ids().len(), 3);
+        assert_eq!(
+            result.upstream_units().len(),
+            result.upstream_unit_ids().len()
+        );
+
+        let terminal = result
+            .upstream_units()
+            .iter()
+            .find(|unit| unit.id() == UnitId::new(3).expect("valid unit id"))
+            .expect("terminal metadata should be present");
+        assert_eq!(terminal.level().get(), 0);
+        assert_eq!(terminal.area().get(), 33.0);
+        assert_eq!(terminal.up_area().map(hfx::AreaKm2::get), Some(66.0));
+        assert_eq!(terminal.outlet().lon(), 1.7);
+        assert_eq!(terminal.outlet().lat(), 0.2);
+    }
+
+    #[test]
+    fn merged_result_unit_records_are_metadata_only() {
+        let (_dir, session) = three_unit_session();
+        let engine = Engine::builder(session).build();
+
+        let result = engine
+            .delineate(coord_in_unit3(), &DelineationOptions::default())
+            .expect("delineation should succeed");
+
+        let metadata = result.upstream_units();
+        assert_eq!(metadata.len(), result.upstream_unit_ids().len());
+        assert!(metadata.iter().all(|unit| unit.level().get() == 0));
+        assert!(metadata.iter().all(|unit| unit.area().get() > 0.0));
+        assert!(metadata.iter().all(|unit| unit.outlet().lon().is_finite()));
+        assert!(metadata.iter().all(|unit| unit.outlet().lat().is_finite()));
+    }
+
+    // ── engine_outlet_outside_catchments ─────────────────────────────────────
+
+    #[test]
+    fn engine_outlet_outside_catchments() {
+        let (_dir, session) = three_unit_session();
+        let engine = Engine::builder(session).build();
+
+        let err = engine
+            .delineate(coord_outside(), &DelineationOptions::default())
+            .expect_err("outlet outside catchments must fail");
+
+        assert!(
+            matches!(err, EngineError::Resolution { .. }),
+            "expected Resolution error, got {err:?}"
+        );
+    }
+
+    // ── engine_batch_mixed_success_failure ────────────────────────────────────
+
+    #[test]
+    fn engine_batch_mixed_success_failure() {
+        let (_dir, session) = three_unit_session();
+        let engine = Engine::builder(session).build();
+
+        let opts = DelineationOptions::default();
+        let results =
+            engine.delineate_batch(&[(coord_in_unit3(), opts.clone()), (coord_outside(), opts)]);
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok(), "first outlet should succeed");
+        assert!(results[1].is_err(), "second outlet should fail");
+    }
+
+    // ── engine_single_headwater_unit ──────────────────────────────────────────
+
+    #[test]
+    fn engine_single_headwater_unit() {
+        // Unit 1 is the headwater (no upstream). Use a coordinate inside unit 1.
+        let (_dir, root) = DatasetBuilder::new(3).build();
+        let session = DatasetSession::open_path(&root).expect("session should open");
+        let engine = Engine::builder(session).build();
+
+        // Unit 1 bbox: (0.50, 0.00, 0.90, 0.40), centre at ~(0.70, 0.20)
+        let coord_in_unit1 = GeoCoord::new(0.70, 0.20);
+        let result = engine
+            .delineate(coord_in_unit1, &DelineationOptions::default())
+            .expect("headwater delineation should succeed");
+
+        assert!(
+            result.upstream_unit_ids().len() == 1,
+            "headwater has exactly 1 unit"
+        );
+        assert!(!result.geometry().0.is_empty(), "geometry is non-empty");
+        assert!(result.area_km2().as_f64() > 0.0, "area is positive");
+    }
+
+    // ── engine_batch_empty_input ──────────────────────────────────────────────
+
+    #[test]
+    fn engine_batch_empty_input() {
+        let (_dir, session) = three_unit_session();
+        let engine = Engine::builder(session).build();
+
+        let results = engine.delineate_batch(&[]);
+        assert!(results.is_empty(), "empty input must yield empty output");
+    }
+
+    // ── engine_refinement_disabled ────────────────────────────────────────────
+
+    #[test]
+    fn engine_refinement_disabled() {
+        let (_dir, session) = three_unit_session();
+        let engine = Engine::builder(session).build();
+
+        let opts = DelineationOptions::default().with_refinement_mode(RefinementMode::Disabled);
+        let result = engine
+            .delineate(coord_in_unit3(), &opts)
+            .expect("delineation should succeed");
+
+        assert_eq!(
+            result.refinement(),
+            &RefinementOutcome::Disabled,
+            "refinement disabled → Disabled outcome"
+        );
+    }
+
+    #[test]
+    fn vector_outlet_on_cell_boundary_keeps_containing_cell_authority() {
+        let (_dir, root) = DatasetBuilder::new(1)
+            .with_rasters()
+            .with_custom_catchments(vec![TestCatchment {
+                id: 1,
+                area_km2: 25.0,
+                up_area_km2: Some(25.0),
+                polygon: (0.0, -5.0, 5.0, 0.0),
+            }])
+            .with_custom_snap_targets(vec![crate::testutil::TestSnapTarget {
+                id: 1,
+                catchment_id: 1,
+                weight: 100.0,
+                is_mainstem: true,
+                geometry: crate::testutil::TestSnapGeometry::Point(2.0, -2.5),
+            }])
+            .build();
+        copy_valid_d8_fixture_tiffs(&root);
+        let session = DatasetSession::open_path(&root).expect("session should open");
+        let engine = Engine::builder(session)
+            .with_raster_source(OutletBoundaryTieRasterSource)
+            .build();
+
+        let result = engine
+            .delineate(
+                GeoCoord::new(2.0, -2.5),
+                &DelineationOptions::default().with_snap_threshold(SnapThreshold::new(500)),
+            )
+            .expect("vector-authoritative delineation should succeed");
+        let RefinementOutcome::Applied {
+            refined_outlet,
+            provenance,
+        } = result.refinement()
+        else {
+            panic!("vector-authoritative refinement should apply");
+        };
+        assert_eq!(
+            provenance,
+            &AppliedRefinementProvenance::new(
+                RefinementStrategyName::BuiltInD8,
+                crate::refinement::AppliedRefinementReason::VectorOutletQuantized {
+                    declaration_index: 0,
+                }
+            )
+        );
+
+        assert_eq!(result.resolved_outlet(), GeoCoord::new(2.0, -2.5));
+        assert_eq!(
+            *refined_outlet,
+            GeoCoord::new(2.5, -2.5),
+            "the containing cell must remain authoritative even when the equally distant other-branch cell has greater accumulation",
+        );
+        let bounds = result
+            .geometry()
+            .bounding_rect()
+            .expect("the two-cell vector branch carve should have bounds");
+        assert_eq!(bounds.min().x, 2.0);
+        assert_eq!(bounds.max().x, 3.0);
+        assert_eq!(bounds.min().y, -3.0);
+        assert_eq!(bounds.max().y, -1.0);
+    }
+
+    fn vector_guard_engine(fixture: VectorGuardFixture) -> (tempfile::TempDir, Engine, GeoCoord) {
+        let (vector_x, terminal_max_x) = match fixture {
+            VectorGuardFixture::OutsideTerminalMask => (4.5, 4.0),
+            VectorGuardFixture::OutsideRasterWindow => (5.5, 5.0),
+            _ => (2.5, 5.0),
+        };
+        let outlet = GeoCoord::new(vector_x, -2.5);
+        let (dir, root) = DatasetBuilder::new(1)
+            .with_rasters()
+            .with_custom_catchments(vec![TestCatchment {
+                id: 1,
+                area_km2: 25.0,
+                up_area_km2: Some(25.0),
+                polygon: (0.0, -5.0, terminal_max_x, 0.0),
+            }])
+            .with_custom_snap_targets(vec![crate::testutil::TestSnapTarget {
+                id: 1,
+                catchment_id: 1,
+                weight: 100.0,
+                is_mainstem: true,
+                geometry: crate::testutil::TestSnapGeometry::Point(vector_x, -2.5),
+            }])
+            .build();
+        if matches!(
+            fixture,
+            VectorGuardFixture::GrassTerminalZero | VectorGuardFixture::GrassSignedExit
+        ) {
+            let manifest_path = root.join("manifest.json");
+            let mut manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&manifest_path).expect("fixture manifest should read"),
+            )
+            .expect("fixture manifest should be JSON");
+            let d8 = manifest["auxiliary"]
+                .as_array_mut()
+                .expect("fixture auxiliary should be an array")
+                .iter_mut()
+                .find(|entry| entry["schema"] == "hfx.aux.d8_raster.v2")
+                .expect("fixture should declare D8 v2");
+            d8["metadata"]["flow_dir_encoding"] = serde_json::Value::String("grass".to_owned());
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).expect("fixture manifest should encode"),
+            )
+            .expect("fixture manifest should write");
+        }
+        copy_valid_d8_fixture_tiffs(&root);
+        let session = DatasetSession::open_path(&root).expect("guard fixture should open");
+        let engine = Engine::builder(session).with_raster_source(fixture).build();
+        (dir, engine, outlet)
+    }
+
+    #[test]
+    fn valid_grass_terminal_vector_cells_apply_under_both_refinement_policies() {
+        for fixture in [
+            VectorGuardFixture::GrassTerminalZero,
+            VectorGuardFixture::GrassSignedExit,
+        ] {
+            let (_dir, engine, outlet) = vector_guard_engine(fixture);
+            let options =
+                DelineationOptions::default().with_snap_threshold(SnapThreshold::new(500));
+            for mode in [RefinementMode::BestEffort, RefinementMode::RequireD8] {
+                let result = engine
+                    .delineate(outlet, &options.clone().with_refinement_mode(mode))
+                    .expect("valid GRASS terminal vector cell should refine");
+                let RefinementOutcome::Applied { provenance, .. } = result.refinement() else {
+                    panic!("valid GRASS terminal vector cell should produce an applied carve");
+                };
+                assert_eq!(
+                    provenance.why(),
+                    &crate::refinement::AppliedRefinementReason::VectorOutletQuantized {
+                        declaration_index: 0,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vector_cell_guard_skips_coarsely_or_fails_precisely_without_raster_fallback() {
+        use crate::algo::VectorOutletGuardFailureKind;
+
+        let cases = [
+            (
+                VectorGuardFixture::BelowThreshold,
+                VectorOutletGuardFailureKind::BelowThreshold,
+                Some(GridCoord::new(2, 2)),
+                Some(100.0),
+            ),
+            (
+                VectorGuardFixture::UndefinedAccumulation,
+                VectorOutletGuardFailureKind::UndefinedAccumulation,
+                Some(GridCoord::new(2, 2)),
+                None,
+            ),
+            (
+                VectorGuardFixture::OutsideTerminalMask,
+                VectorOutletGuardFailureKind::OutsideTerminalMask,
+                Some(GridCoord::new(2, 4)),
+                Some(800.0),
+            ),
+            (
+                VectorGuardFixture::UndefinedFlowDirection,
+                VectorOutletGuardFailureKind::UndefinedFlowDirection,
+                Some(GridCoord::new(2, 2)),
+                Some(800.0),
+            ),
+        ];
+
+        for (fixture, kind, mapped_cell, measured_accumulation) in cases {
+            let (_dir, engine, outlet) = vector_guard_engine(fixture);
+            let options =
+                DelineationOptions::default().with_snap_threshold(SnapThreshold::new(500));
+            let best_effort = engine
+                .delineate(outlet, &options)
+                .expect("best effort should retain the coarse terminal");
+            let disabled = engine
+                .delineate(
+                    outlet,
+                    &options
+                        .clone()
+                        .with_refinement_mode(RefinementMode::Disabled),
+                )
+                .expect("disabled delineation should succeed");
+            assert_eq!(
+                encode_wkb_multi_polygon(best_effort.geometry()).unwrap(),
+                encode_wkb_multi_polygon(disabled.geometry()).unwrap(),
+                "guard rejection must retain the whole terminal"
+            );
+            assert_eq!(
+                best_effort.refinement(),
+                &RefinementOutcome::BestEffortSkipped {
+                    provenance: BestEffortRefinementProvenance::new(
+                        RefinementStrategyName::BestEffortD8IfPresent,
+                        BestEffortSkipReason::VectorOutletGuardFailed {
+                            kind,
+                            requested_threshold: SnapThreshold::new(500),
+                            effective_threshold: 500.0,
+                            units: FlowAccumulationUnits::Cells,
+                            mapped_cell,
+                            measured_accumulation,
+                        }
+                    ),
+                }
+            );
+
+            let required = engine
+                .delineate(
+                    outlet,
+                    &options
+                        .clone()
+                        .with_refinement_mode(RefinementMode::RequireD8),
+                )
+                .expect_err("RequireD8 must preserve the vector guard failure");
+            assert!(matches!(
+                required,
+                EngineError::Refinement {
+                    source: RefinementError::VectorOutletUnusable { ref failure },
+                    ..
+                } if failure.kind == kind
+                    && failure.mapped_cell == mapped_cell
+                    && failure.measured_accumulation == measured_accumulation
+            ));
+        }
+    }
+
+    #[test]
+    fn vector_point_outside_localized_window_records_absent_mapping_evidence() {
+        use crate::algo::VectorOutletGuardFailureKind;
+
+        let (_dir, engine, outlet) = vector_guard_engine(VectorGuardFixture::OutsideRasterWindow);
+        let options = DelineationOptions::default().with_snap_threshold(SnapThreshold::new(500));
+        let result = engine
+            .delineate(outlet, &options)
+            .expect("best effort should retain a coarse result");
+        assert_eq!(
+            result.refinement(),
+            &RefinementOutcome::BestEffortSkipped {
+                provenance: BestEffortRefinementProvenance::new(
+                    RefinementStrategyName::BestEffortD8IfPresent,
+                    BestEffortSkipReason::VectorOutletGuardFailed {
+                        kind: VectorOutletGuardFailureKind::GridMapping,
+                        requested_threshold: SnapThreshold::new(500),
+                        effective_threshold: 500.0,
+                        units: FlowAccumulationUnits::Cells,
+                        mapped_cell: None,
+                        measured_accumulation: None,
+                    }
+                ),
+            }
+        );
+        let required = engine
+            .delineate(
+                outlet,
+                &options.with_refinement_mode(RefinementMode::RequireD8),
+            )
+            .expect_err("RequireD8 must expose mapping failure");
+        assert!(matches!(
+            required,
+            EngineError::Refinement {
+                source: RefinementError::VectorOutletUnusable { failure },
+                ..
+            } if failure.kind == VectorOutletGuardFailureKind::GridMapping
+                && failure.mapped_cell.is_none()
+                && failure.measured_accumulation.is_none()
+        ));
+    }
+
+    #[test]
+    fn applied_refinement_materializes_terminal_geometry() {
+        let (_dir, root) = DatasetBuilder::new(2)
+            .with_rasters()
+            .with_custom_catchments(vec![
+                TestCatchment {
+                    id: 1,
+                    area_km2: 1.0,
+                    up_area_km2: None,
+                    polygon: (-5.0, -5.0, -4.0, -4.0),
+                },
+                TestCatchment {
+                    id: 2,
+                    area_km2: 25.0,
+                    up_area_km2: Some(26.0),
+                    polygon: (0.0, -5.0, 5.0, 0.0),
+                },
+            ])
+            .build();
+        copy_valid_d8_fixture_tiffs(&root);
+        let session = DatasetSession::open_path(&root).expect("session should open");
+        let _measurement_scope = ReaderSessionMeasurementScope::enter();
+        let engine = Engine::builder(session)
+            .with_raster_source(AppliedRefinementRasterSource)
+            .build();
+        let terminal = UnitId::new(2).expect("valid unit id");
+
+        let result = engine
+            .delineate(
+                GeoCoord::new(2.5, -2.5),
+                &DelineationOptions::default().with_snap_threshold(SnapThreshold::new(500)),
+            )
+            .expect("delineation should succeed");
+
+        assert!(matches!(
+            result.refinement(),
+            RefinementOutcome::Applied { .. }
+        ));
+        assert!(
+            engine
+                .session
+                .catchments()
+                .geometry_decode_count_for_test(terminal)
+                > 0,
+            "terminal geometry should be materialized during applied refinement"
+        );
+    }
+
+    fn copy_valid_d8_fixture_tiffs(root: &std::path::Path) {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/parity/v021_synthetic_refined");
+        std::fs::copy(fixture.join("flow_dir.tif"), root.join("flow_dir.tif"))
+            .expect("fixture flow_dir.tif should copy over placeholder");
+        std::fs::copy(fixture.join("flow_acc.tif"), root.join("flow_acc.tif"))
+            .expect("fixture flow_acc.tif should copy over placeholder");
+    }
+
+    // ── engine_geometry_wkb_accessor ─────────────────────────────────────────
+
+    #[test]
+    fn engine_geometry_wkb_accessor() {
+        let (_dir, session) = three_unit_session();
+        let engine = Engine::builder(session).build();
+
+        let result = engine
+            .delineate(coord_in_unit3(), &DelineationOptions::default())
+            .expect("delineation should succeed");
+
+        let wkb = result.geometry_wkb().expect("WKB encoding should succeed");
+        assert!(!wkb.is_empty(), "WKB bytes must not be empty");
+        assert_eq!(wkb[0], 0x01, "first byte must be 0x01 (little-endian)");
+    }
+
+    #[test]
+    fn projection_seam_errors_keep_existing_engine_routes() {
+        let unsupported = EngineError::from(TerminalRefinementError::D8Selection {
+            unit_id: 42,
+            source: SessionError::UnsupportedD8Crs {
+                declared_crs: "EPSG:3857".to_string(),
+                source: ProjectionError::UnsupportedCrs { epsg: 3857 },
+            },
+        });
+        assert!(matches!(
+            unsupported,
+            EngineError::D8Selection {
+                source: SessionError::UnsupportedD8Crs { .. },
+                ..
+            }
+        ));
+
+        let geographic_km2 = EngineError::from(TerminalRefinementError::Algorithm {
+            unit_id: 42,
+            source: RefinementError::GeographicKm2Unsupported {
+                epsg: 4326,
+                units: FlowAccumulationUnits::Km2,
+            },
+        });
+        assert!(matches!(
+            geographic_km2,
+            EngineError::Refinement {
+                source: RefinementError::GeographicKm2Unsupported { .. },
+                ..
+            }
+        ));
+
+        let inverse = EngineError::from(TerminalRefinementError::Algorithm {
+            unit_id: 42,
+            source: RefinementError::InverseProjection {
+                epsg: 8857,
+                source: ProjectionError::OutOfDomain { x: 1.0e8, y: 1.0e8 },
+            },
+        });
+        assert!(matches!(
+            inverse,
+            EngineError::Refinement {
+                source: RefinementError::InverseProjection { epsg: 8857, .. },
+                ..
+            }
+        ));
+
+        let directional_nodata = EngineError::from(TerminalRefinementError::Algorithm {
+            unit_id: 42,
+            source: RefinementError::RasterLoad {
+                source: RasterSourceError::InvalidFlowDirectionNodata {
+                    nodata: 1,
+                    encoding: FlowDirEncoding::Esri,
+                },
+            },
+        });
+        assert!(matches!(
+            directional_nodata,
+            EngineError::Refinement {
+                unit_id: 42,
+                source: RefinementError::RasterLoad {
+                    source: RasterSourceError::InvalidFlowDirectionNodata {
+                        nodata: 1,
+                        encoding: FlowDirEncoding::Esri,
+                    },
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn defensive_terminal_error_rows_have_exact_best_effort_classifications() {
+        fn assert_classification(error: &TerminalRefinementError, expected: BestEffortSkipReason) {
+            let actual = best_effort_skip_reason(error);
+            assert_eq!(actual.category(), expected.category());
+            assert_eq!(actual, expected);
+        }
+
+        let ambiguous_source = SessionError::AmbiguousD8Coverage {
+            min_x: 0.0,
+            min_y: -1.0,
+            max_x: 1.0,
+            max_y: 0.0,
+            declaration_indices: vec![0, 1],
+        };
+        let ambiguous_diagnostic = ambiguous_source.to_string();
+        let ambiguous_error = TerminalRefinementError::D8Selection {
+            unit_id: 42,
+            source: ambiguous_source,
+        };
+
+        let cache_source = SessionError::Cache(CacheError::UnsupportedCog {
+            path: ObjectPath::from("flow_dir.tif"),
+            reason: "strip layout is unsupported".to_string(),
+        });
+        let cache_diagnostic = cache_source.to_string();
+        let cache_error = TerminalRefinementError::RasterLocalize {
+            unit_id: 42,
+            kind: RasterKind::FlowDir,
+            source: cache_source,
+        };
+
+        let integrity_source = SessionError::IntegrityViolation {
+            detail: "selected D8 handle lost its declaration".to_string(),
+        };
+        let integrity_error = TerminalRefinementError::D8Selection {
+            unit_id: 42,
+            source: integrity_source,
+        };
+
+        let empty_contained_error = TerminalRefinementError::EmptyContainedTerminalGeometry;
+
+        let missing_source_error = TerminalRefinementError::RasterSource {
+            unit_id: 42,
+            strategy: RefinementStrategyName::BuiltInD8,
+        };
+
+        assert_classification(
+            &ambiguous_error,
+            BestEffortSkipReason::Availability {
+                source: BestEffortSkipSource::D8Selection,
+                diagnostic: ambiguous_diagnostic,
+            },
+        );
+        assert_classification(
+            &cache_error,
+            BestEffortSkipReason::Availability {
+                source: BestEffortSkipSource::RasterLocalization,
+                diagnostic: cache_diagnostic,
+            },
+        );
+        assert_classification(
+            &integrity_error,
+            BestEffortSkipReason::DataGeometryIntegrity {
+                source: BestEffortSkipSource::D8Selection,
+                diagnostic: "integrity violation: selected D8 handle lost its declaration"
+                    .to_string(),
+            },
+        );
+        assert_classification(
+            &empty_contained_error,
+            BestEffortSkipReason::DataGeometryIntegrity {
+                source: BestEffortSkipSource::ContainedTerminalGeometry,
+                diagnostic: empty_contained_error.to_string(),
+            },
+        );
+        assert_classification(
+            &missing_source_error,
+            BestEffortSkipReason::Availability {
+                source: BestEffortSkipSource::RasterSource,
+                diagnostic: missing_source_error.to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn defensive_algorithm_rows_have_exact_best_effort_classifications() {
+        let algorithm_sources = [
+            RefinementError::DegenerateTerminalPolygon,
+            RefinementError::EmptyRasterMask { rows: 1, cols: 1 },
+            RefinementError::MaskFailed {
+                source: RasterTileError::DimensionMismatch {
+                    expected: 1,
+                    rows: 1,
+                    cols: 1,
+                    actual: 0,
+                },
+            },
+            RefinementError::SnapFailed {
+                source: SnapError::OutletOutOfBounds {
+                    epsg: 4326,
+                    outlet_x: 2.5,
+                    outlet_y: -2.5,
+                    rows: 1,
+                    cols: 1,
+                },
+            },
+            RefinementError::EmptyPolygonization,
+        ];
+        for source_error in algorithm_sources {
+            let diagnostic = source_error.to_string();
+            let error = TerminalRefinementError::Algorithm {
+                unit_id: 42,
+                source: source_error,
+            };
+            let actual = best_effort_skip_reason(&error);
+            let expected = BestEffortSkipReason::DataGeometryIntegrity {
+                source: BestEffortSkipSource::RefinementAlgorithm,
+                diagnostic,
+            };
+            assert_eq!(actual.category(), expected.category());
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+/// Bounding rectangle covering every pre-merge unit, in EPSG:4326.
+///
+/// Returns `Ok(None)` when no unit carries a usable rectangle — the empty
+/// watershed case, not an error.
+///
+/// The f64 bounds are narrowed to the f32 that [`BoundingBox`] stores. That
+/// narrowing needs no correction: the stored row bboxes were narrowed from f64
+/// the same way, so the two agree at the edge, and f32 spacing only collapses a
+/// degree-scale rectangle once its span approaches 1e-7° — about a centimetre,
+/// which no watershed reaches. A rectangle `BoundingBox` still rejects is a
+/// real integrity problem and is reported rather than papered over.
+fn watershed_bbox(units: &PreMergeDrainageUnits) -> Result<Option<BoundingBox>, EngineError> {
+    let mut bounds: Option<geo::Rect<f64>> = None;
+    for unit in units.units() {
+        let Some(rect) = unit.geometry().bounding_rect() else {
+            continue;
+        };
+        bounds = Some(match bounds {
+            None => rect,
+            Some(acc) => geo::Rect::new(
+                geo::coord! {
+                    x: acc.min().x.min(rect.min().x),
+                    y: acc.min().y.min(rect.min().y),
+                },
+                geo::coord! {
+                    x: acc.max().x.max(rect.max().x),
+                    y: acc.max().y.max(rect.max().y),
+                },
+            ),
+        });
+    }
+    let Some(rect) = bounds else {
+        return Ok(None);
+    };
+
+    let minx = rect.min().x as f32;
+    let miny = rect.min().y as f32;
+    let maxx = rect.max().x as f32;
+    let maxy = rect.max().y as f32;
+
+    BoundingBox::new(minx, miny, maxx, maxy)
+        .map(Some)
+        .map_err(|source| EngineError::ReachQuery {
+            unit_id: units.terminal().get(),
+            source: SessionError::integrity(format!(
+                "watershed bbox ({minx}, {miny}, {maxx}, {maxy}) is not a valid query rectangle: {source}"
+            )),
+        })
+}

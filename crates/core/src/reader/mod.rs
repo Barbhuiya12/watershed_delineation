@@ -1,0 +1,205 @@
+//! Shared helpers and sub-readers for HFX dataset artifacts.
+
+pub mod catchment_store;
+pub mod graph;
+pub(crate) mod id_index;
+pub mod manifest;
+pub mod snap_store;
+#[cfg(test)]
+pub(crate) mod test_instrumentation;
+
+#[cfg(test)]
+mod catchment_store_perf_tests;
+
+use arrow::array::{Array, Float32Array, StructArray};
+use arrow::datatypes::{DataType, Schema};
+use hfx::BoundingBox;
+use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::statistics::Statistics;
+
+use crate::error::SessionError;
+
+/// Verify that `schema` contains a column named `name` with the expected data
+/// type. Returns the column index on success.
+///
+/// Accepts `LargeBinary` where `Binary` is expected, and `LargeList` where
+/// `List` is expected, to tolerate writers that emit large variants.
+pub(crate) fn require_column(
+    schema: &Schema,
+    name: &'static str,
+    expected_type: &DataType,
+    artifact: &'static str,
+) -> Result<usize, SessionError> {
+    let (idx, field) = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|(_, f)| f.name() == name)
+        .ok_or_else(|| {
+            SessionError::parquet_schema(artifact, format!("missing required column {name:?}"))
+        })?;
+
+    let actual = field.data_type();
+    if actual != expected_type && !is_accepted_large_variant(actual, expected_type) {
+        return Err(SessionError::parquet_schema(
+            artifact,
+            format!("column {name:?} has type {actual:?}, expected {expected_type:?}"),
+        ));
+    }
+
+    Ok(idx)
+}
+
+/// Return `true` if `actual` is the large variant of `expected`.
+///
+/// Handles `LargeBinary` ↔ `Binary` and `LargeList` ↔ `List`.
+fn is_accepted_large_variant(actual: &DataType, expected: &DataType) -> bool {
+    matches!(
+        (actual, expected),
+        (DataType::LargeBinary, DataType::Binary) | (DataType::LargeList(_), DataType::List(_))
+    )
+}
+
+/// Pre-resolved leaf column indices for the four fields in the HFX `bbox` struct.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BboxColIndices {
+    /// Leaf column index for `bbox.xmin`.
+    pub minx: usize,
+    /// Leaf column index for `bbox.ymin`.
+    pub miny: usize,
+    /// Leaf column index for `bbox.xmax`.
+    pub maxx: usize,
+    /// Leaf column index for `bbox.ymax`.
+    pub maxy: usize,
+}
+
+/// Extract the bounding box envelope for a row group from its column statistics.
+///
+/// Returns `None` if any bbox column lacks min/max statistics, or if the
+/// resulting values form a degenerate bounding box.
+pub(crate) fn extract_row_group_bbox(
+    rg: &RowGroupMetaData,
+    indices: &BboxColIndices,
+) -> Option<BoundingBox> {
+    let minx = float_min(rg.column(indices.minx).statistics()?)?;
+    let miny = float_min(rg.column(indices.miny).statistics()?)?;
+    let maxx = float_max(rg.column(indices.maxx).statistics()?)?;
+    let maxy = float_max(rg.column(indices.maxy).statistics()?)?;
+
+    BoundingBox::new(minx, miny, maxx, maxy).ok()
+}
+
+/// Validate that `schema` contains the HFX `bbox` struct with Float32 leaves.
+pub(crate) fn validate_bbox_struct_field(
+    schema: &Schema,
+    nullable: bool,
+    artifact: &'static str,
+) -> Result<(), SessionError> {
+    let field = schema
+        .field_with_name("bbox")
+        .map_err(|_| SessionError::MissingBboxColumn {
+            artifact,
+            column: "bbox",
+        })?;
+    if field.is_nullable() != nullable {
+        return Err(SessionError::parquet_schema(
+            artifact,
+            format!(
+                "column \"bbox\" has nullable={}, expected nullable={nullable}",
+                field.is_nullable()
+            ),
+        ));
+    }
+    let DataType::Struct(fields) = field.data_type() else {
+        return Err(SessionError::parquet_schema(
+            artifact,
+            "column \"bbox\" must be struct<xmin,ymin,xmax,ymax: Float32>",
+        ));
+    };
+    let expected = ["xmin", "ymin", "xmax", "ymax"];
+    if fields.len() != expected.len() {
+        return Err(SessionError::parquet_schema(
+            artifact,
+            "column \"bbox\" must contain xmin, ymin, xmax, ymax",
+        ));
+    }
+    for (field, expected_name) in fields.iter().zip(expected) {
+        if field.name() != expected_name || field.data_type() != &DataType::Float32 {
+            return Err(SessionError::parquet_schema(
+                artifact,
+                "column \"bbox\" must be struct<xmin,ymin,xmax,ymax: Float32>",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve HFX `bbox` struct leaf columns by full dotted Parquet paths.
+pub(crate) fn bbox_struct_leaf_indices(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    artifact: &'static str,
+) -> Result<Option<BboxColIndices>, SessionError> {
+    let leaf = |name: &'static str| {
+        parquet_schema
+            .columns()
+            .iter()
+            .position(|column| column.path().string() == name)
+    };
+    let indices = [
+        leaf("bbox.xmin"),
+        leaf("bbox.ymin"),
+        leaf("bbox.xmax"),
+        leaf("bbox.ymax"),
+    ];
+    if indices.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let [Some(minx), Some(miny), Some(maxx), Some(maxy)] = indices else {
+        return Err(SessionError::parquet_schema(
+            artifact,
+            "bbox struct must contain xmin, ymin, xmax, ymax leaves",
+        ));
+    };
+    Ok(Some(BboxColIndices {
+        minx,
+        miny,
+        maxx,
+        maxy,
+    }))
+}
+
+/// Return a Float32 child leaf from a validated `bbox` struct array.
+pub(crate) fn bbox_struct_leaf<'a>(
+    bbox: &'a StructArray,
+    name: &'static str,
+    artifact: &'static str,
+) -> Result<&'a Float32Array, SessionError> {
+    bbox.column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
+        .ok_or_else(|| {
+            SessionError::parquet_schema(
+                artifact,
+                format!("bbox.{name} leaf missing or wrong type"),
+            )
+        })
+}
+
+/// Extract the float minimum from a `Statistics` value.
+///
+/// Returns `None` for non-float statistics or when `min_opt` is absent.
+fn float_min(stats: &Statistics) -> Option<f32> {
+    match stats {
+        Statistics::Float(typed) => typed.min_opt().copied(),
+        _ => None,
+    }
+}
+
+/// Extract the float maximum from a `Statistics` value.
+///
+/// Returns `None` for non-float statistics or when `max_opt` is absent.
+fn float_max(stats: &Statistics) -> Option<f32> {
+    match stats {
+        Statistics::Float(typed) => typed.max_opt().copied(),
+        _ => None,
+    }
+}

@@ -1,0 +1,104 @@
+//! Pure-Rust watershed delineation algorithms.
+
+// ── Foundation types ─────────────────────────────────────────────────────────
+pub mod area;
+pub mod clean_epsilon;
+pub mod coord;
+pub mod distance;
+pub mod flow_dir;
+pub mod geo_transform;
+pub mod projection;
+pub mod snap_threshold;
+pub mod tile_state;
+
+// ── Raster infrastructure ────────────────────────────────────────────────────
+pub mod accumulation_tile;
+pub mod catchment_mask;
+pub mod flow_direction_tile;
+pub mod raster_tile;
+
+// ── Raster algorithms ────────────────────────────────────────────────────────
+pub mod polygonize;
+pub mod rasterize;
+pub mod refine;
+pub mod snap;
+pub mod trace;
+
+// ── Graph traversal ──────────────────────────────────────────────────────────
+pub mod upstream;
+
+// ── Geometry processing ──────────────────────────────────────────────────────
+pub mod canonical_wkb;
+pub mod channel_length;
+pub mod clean_topology;
+pub mod dissolve;
+pub mod hole_fill;
+pub mod largest_polygon;
+pub mod watershed_area;
+pub mod watershed_perimeter;
+
+// ── Pipeline + traits ────────────────────────────────────────────────────────
+pub mod self_intersection;
+pub mod traits;
+pub mod watershed_geometry;
+
+// ── WKB decoding ─────────────────────────────────────────────────────────────
+pub mod wkb;
+
+// ── Re-exports: foundation types ─────────────────────────────────────────────
+pub use area::AreaKm2;
+pub use clean_epsilon::{CleanEpsilon, DEFAULT_CLEANING_EPSILON};
+pub use coord::{GeoCoord, GridCoord, GridDims};
+pub use distance::{DistanceMetres, geodesic_distance};
+pub use flow_dir::{FlowDir, InvalidFlowDir};
+pub use geo_transform::GeoTransform;
+pub use projection::{Crs, InverseStage, NativeCoord, ProjectionError, forward, inverse};
+pub use snap_threshold::SnapThreshold;
+pub use tile_state::{Masked, Raw};
+
+// ── Re-exports: raster infrastructure ────────────────────────────────────────
+pub use accumulation_tile::AccumulationTile;
+pub use catchment_mask::CatchmentMask;
+pub use flow_direction_tile::{DecodedFlowCell, FlowDirectionTile, FlowDirectionTileError};
+pub use raster_tile::{RasterTile, RasterTileError};
+
+// ── Re-exports: raster algorithms ────────────────────────────────────────────
+pub use polygonize::polygonize;
+pub use rasterize::{rasterize_multi_polygon, rasterize_polygon};
+pub use refine::{
+    RasterOutlet, RasterSeedKind, RefinementError, RefinementResult, VectorOutletGuardFailure,
+    VectorOutletGuardFailureKind, refine_terminal, refine_terminal_from_source,
+};
+pub use snap::{
+    GridMappingError, NearestAccumulationRasterSeedRanker, RasterSeedCandidate, RasterSeedRanker,
+    SnapError, SnappedPoint, effective_threshold, quantize_grid_cell, snap_pour_point,
+};
+pub use trace::trace_upstream;
+
+// ── Re-exports: graph traversal ──────────────────────────────────────────────
+pub use upstream::{TraversalError, UpstreamUnits, collect_upstream};
+
+// ── Re-exports: geometry processing ──────────────────────────────────────────
+pub use canonical_wkb::{
+    CANONICAL_WKB_DECIMAL_PRECISION, CANONICAL_WKB_VERSION, canonical_wkb_multi_polygon,
+};
+pub use channel_length::{ChannelLengthError, ChannelLengthKm, geodesic_channel_length};
+pub use clean_topology::clean_topology;
+pub use dissolve::{DissolveError, dissolve};
+pub use hole_fill::{DEFAULT_FILL_THRESHOLD_PX, HoleFillMode, fill_holes};
+pub use largest_polygon::largest_polygon;
+pub use watershed_area::{WatershedAreaError, geodesic_area, geodesic_area_multi};
+pub use watershed_perimeter::{
+    PerimeterKm, WatershedPerimeterError, geodesic_perimeter, geodesic_perimeter_multi,
+};
+
+// ── Re-exports: pipeline + traits ────────────────────────────────────────────
+pub use self_intersection::has_self_intersections;
+pub use traits::{GeometryRepair, GeometryRepairError, RasterSource, RasterSourceError};
+pub use watershed_geometry::{Dissolved, HolesFilled, TopologyCleaned, WatershedGeometry};
+
+// ── Re-exports: WKB decoding ──────────────────────────────────────────────────
+pub use wkb::{
+    WkbDecodeError, WkbEncodeError, decode_wkb, decode_wkb_multi_polygon, decode_wkb_polygon,
+    encode_wkb_multi_polygon,
+};

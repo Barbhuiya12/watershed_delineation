@@ -1,0 +1,7 @@
+basin_code,basin_name,river_name,latitude,longitude,state,authority
+CWC_01,Mandla Station,Narmada,22.5980,80.3710,Madhya Pradesh,Central Water Commission (CWC)
+CWC_02,Old Railway Bridge,Yamuna,28.6650,77.2480,Delhi,Central Water Commission (CWC)
+CWC_03,Gomti Barrage Lucknow,Gomti,26.8520,80.9590,Uttar Pradesh,Central Water Commission (CWC)
+CWC_04,Madurai Station,Vaigai,9.9250,78.1210,Tamil Nadu,Central Water Commission (CWC)
+CWC_05,Kampur Station,Kopili,26.0280,92.8120,Assam,Central Water Commission (CWC)
+CWC_06,Musiri Station,Cauvery,10.9410,78.4480,Tamil Nadu,Central Water Commission (CWC)

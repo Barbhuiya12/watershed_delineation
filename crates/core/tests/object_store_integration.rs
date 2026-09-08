@@ -1,0 +1,691 @@
+//! Object-store integration coverage for remote HFX sessions.
+
+use std::io::{Cursor, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use arrow::array::{
+    BinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int64Array, Int64Builder,
+    ListBuilder,
+};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
+use futures_util::TryStreamExt;
+use geo::{BoundingRect, Coord, LineString, MultiPolygon, Polygon};
+use hfx::BoundingBox;
+use object_store::memory::InMemory;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use parquet::arrow::ArrowWriter;
+use pourpoint_core::algo::{GeoCoord, canonical_wkb_multi_polygon};
+use pourpoint_core::engine::{DelineationOptions, RefinementOutcome};
+use pourpoint_core::refinement::{BestEffortSkipCategory, BestEffortSkipSource};
+use pourpoint_core::session::{DatasetSession, RasterKind};
+use pourpoint_core::testutil::{bbox_struct_array, bbox_struct_field};
+use pourpoint_core::{
+    BestEffortRefinementProvenance, BestEffortSkipReason, Engine, EngineError, RefinementMode,
+    RefinementStrategyName, SessionError,
+};
+use tempfile::TempDir;
+use tiff::decoder::Decoder;
+use tiff::tags::Tag;
+use url::Url;
+
+static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct CacheEnv {
+    _guard: MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl CacheEnv {
+    fn set(path: &Path) -> Self {
+        let guard = CACHE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HFX_CACHE_DIR");
+        // SAFETY: tests in this binary serialize HFX_CACHE_DIR changes with
+        // CACHE_ENV_LOCK and restore the previous value before unlocking.
+        unsafe {
+            std::env::set_var("HFX_CACHE_DIR", path);
+        }
+        Self {
+            _guard: guard,
+            previous,
+        }
+    }
+}
+
+impl Drop for CacheEnv {
+    fn drop(&mut self) {
+        // SAFETY: CACHE_ENV_LOCK is still held while the prior environment
+        // value is restored.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("HFX_CACHE_DIR", value),
+                None => std::env::remove_var("HFX_CACHE_DIR"),
+            }
+        }
+    }
+}
+
+#[test]
+fn phase_3a7_open_remote_inmemory_reads_manifest_graph_and_catchments() {
+    let cache_dir = TempDir::new().unwrap();
+    let _cache_env = CacheEnv::set(cache_dir.path());
+    let root = ObjectPath::from("phase-3a7/full-open");
+    let url = Url::parse("s3://pourpoint-test/phase-3a7/full-open").unwrap();
+    let store = Arc::new(InMemory::new());
+    put_remote_fixture(&store, &root, RemoteFixture::Full);
+
+    let session = DatasetSession::open_remote_with_store(store, &root, &url)
+        .expect("remote session should open from InMemory object store");
+
+    assert_eq!(session.manifest().unit_count().get(), 3);
+    assert_eq!(session.graph().len(), 3);
+    assert_eq!(session.catchments().total_rows(), 3);
+
+    let bbox = BoundingBox::new(1.55, 0.05, 1.85, 0.35).unwrap();
+    let rows = session
+        .catchments()
+        .query_by_bbox(&bbox)
+        .expect("remote catchments should be queryable");
+    assert_eq!(rows.len(), 1);
+
+    assert!(
+        cache_dir
+            .path()
+            .join("testfabric")
+            .join("test-v1")
+            .join("manifest.json")
+            .is_file()
+    );
+    assert!(
+        cache_dir
+            .path()
+            .join("testfabric")
+            .join("test-v1")
+            .join("graph.parquet")
+            .is_file()
+    );
+}
+
+#[test]
+fn phase_3a7_delineate_remote_inmemory_end_to_end_and_reuses_manifest_graph_cache() {
+    let cache_dir = TempDir::new().unwrap();
+    let _cache_env = CacheEnv::set(cache_dir.path());
+    let root = ObjectPath::from("phase-3a7/delineate-cache");
+    let url = Url::parse("s3://pourpoint-test/phase-3a7/delineate-cache").unwrap();
+    let first_store = Arc::new(InMemory::new());
+    put_remote_fixture(&first_store, &root, RemoteFixture::Full);
+
+    let first_session = DatasetSession::open_remote_with_store(first_store, &root, &url)
+        .expect("first remote session should fetch and cache manifest and graph");
+    assert_remote_delineation_succeeds(first_session);
+
+    let catchments_only_store = Arc::new(InMemory::new());
+    put_remote_fixture(&catchments_only_store, &root, RemoteFixture::CatchmentsOnly);
+
+    let cached_session = DatasetSession::open_remote_with_store(catchments_only_store, &root, &url)
+        .expect("cached manifest and graph should combine with remote catchments");
+    assert_remote_delineation_succeeds(cached_session);
+}
+
+#[test]
+fn remote_d8_localization_failure_skips_best_effort_and_stays_fatal_when_required() {
+    let cache_dir = TempDir::new().unwrap();
+    let _cache_env = CacheEnv::set(cache_dir.path());
+    let root = ObjectPath::from("m3-s1/missing-d8");
+    let url = Url::parse("s3://pourpoint-test/m3-s1/missing-d8").unwrap();
+    let store = Arc::new(InMemory::new());
+    put_remote_fixture(&store, &root, RemoteFixture::D8Missing);
+    let delineate = |mode| {
+        let session = DatasetSession::open_remote_with_store(store.clone(), &root, &url)
+            .expect("remote session should open");
+        Engine::builder(session).build().delineate(
+            GeoCoord::new(1.70, 0.20),
+            &DelineationOptions::default().with_refinement_mode(mode),
+        )
+    };
+    let best_effort = delineate(RefinementMode::BestEffort)
+        .expect("BestEffort should skip the missing remote D8 object");
+    let disabled = delineate(RefinementMode::Disabled).expect("Disabled should succeed");
+    let required_error =
+        delineate(RefinementMode::RequireD8).expect_err("RequireD8 should retain selection error");
+    let expected_reason = BestEffortSkipReason::Availability {
+        source: BestEffortSkipSource::D8Selection,
+        diagnostic: "failed to read D8 COG extent header for declaration 0 FlowDir at missing-flow-dir.tif: failed to fetch remote cache object m3-s1/missing-d8/missing-flow-dir.tif: Object at location m3-s1/missing-d8/missing-flow-dir.tif not found: No data in memory found. Location: m3-s1/missing-d8/missing-flow-dir.tif".to_string(),
+    };
+    assert_eq!(
+        expected_reason.category(),
+        BestEffortSkipCategory::Availability
+    );
+    assert_eq!(
+        best_effort.refinement(),
+        &RefinementOutcome::BestEffortSkipped {
+            provenance: BestEffortRefinementProvenance::new(
+                RefinementStrategyName::BestEffortD8IfPresent,
+                expected_reason
+            ),
+        }
+    );
+    assert_eq!(
+        canonical_wkb_multi_polygon(best_effort.geometry())
+            .expect("BestEffort geometry should canonicalize"),
+        canonical_wkb_multi_polygon(disabled.geometry())
+            .expect("Disabled geometry should canonicalize")
+    );
+    assert!(matches!(
+        required_error,
+        EngineError::D8Selection {
+            source: SessionError::CogExtentHeaderRead { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn remote_reader_accepts_out_of_line_gdal_nodata() {
+    const ORIGINAL_ROOT: &str = "m3-s3/generated-512-original";
+    const FLOW_ACC_PROBE_ROOT: &str = "m3-s3/generated-512-flow-acc-probe";
+    const ARTIFACT_KEYS: [&str; 5] = [
+        "manifest.json",
+        "graph.parquet",
+        "catchments.parquet",
+        "aux/d8/projected/flow_dir.tif",
+        "aux/d8/projected/flow_acc.tif",
+    ];
+    const FLOW_DIR_RED_DIAGNOSTIC: &str = "failed to read D8 COG extent header for declaration 0 FlowDir at aux/d8/projected/flow_dir.tif: unsupported remote COG raster m3-s3/generated-512-original/aux/d8/projected/flow_dir.tif: TIFF tag 42113 out-of-line ASCII is unsupported";
+    const FLOW_ACC_RED_DIAGNOSTIC: &str = "failed to read D8 COG extent header for declaration 0 FlowAcc at aux/d8/projected/flow_acc.tif: unsupported remote COG raster m3-s3/generated-512-flow-acc-probe/aux/d8/projected/flow_acc.tif: TIFF tag 42113 out-of-line ASCII is unsupported";
+
+    let cache_dir = TempDir::new().unwrap();
+    let _cache_env = CacheEnv::set(cache_dir.path());
+    let store = Arc::new(InMemory::new());
+    let source_manifest =
+        include_str!("fixtures/parity/tiny-with-aux-d8-projected-grass/manifest.json");
+    let graph = include_bytes!("fixtures/parity/tiny-with-aux-d8-projected-grass/graph.parquet");
+    let catchments =
+        include_bytes!("fixtures/parity/tiny-with-aux-d8-projected-grass/catchments.parquet");
+    let flow_dir = classic_tiled_tiff(GeneratedRaster::FlowDirOutOfLine);
+    let flow_dir_probe = classic_tiled_tiff(GeneratedRaster::FlowDirInlineProbe);
+    let flow_acc = classic_tiled_tiff(GeneratedRaster::FlowAccOutOfLine);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        for (root, identity, generated_flow_dir) in [
+            (ORIGINAL_ROOT, "generated-512-original", flow_dir.as_slice()),
+            (
+                FLOW_ACC_PROBE_ROOT,
+                "generated-512-flow-acc-probe",
+                flow_dir_probe.as_slice(),
+            ),
+        ] {
+            let manifest = generated_manifest(source_manifest, identity);
+            for (key, payload) in [
+                ("manifest.json", manifest.as_bytes()),
+                ("graph.parquet", graph.as_slice()),
+                ("catchments.parquet", catchments.as_slice()),
+                ("aux/d8/projected/flow_dir.tif", generated_flow_dir),
+                ("aux/d8/projected/flow_acc.tif", flow_acc.as_slice()),
+            ] {
+                let path = ObjectPath::from(format!("{root}/{key}"));
+                store
+                    .put(&path, PutPayload::from(payload.to_vec()))
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to stage {path}: {error}"));
+            }
+        }
+
+        for root in [ORIGINAL_ROOT, FLOW_ACC_PROBE_ROOT] {
+            let root_path = ObjectPath::from(root);
+            let staged = store
+                .list(Some(&root_path))
+                .map_ok(|metadata| metadata.location.to_string())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_or_else(|error| panic!("failed to list staged root {root}: {error}"));
+            let expected = ARTIFACT_KEYS
+                .map(|key| format!("{root}/{key}"))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            let actual = staged
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            for key in &expected {
+                assert!(actual.contains(key), "missing staged object {key}");
+            }
+            assert_eq!(actual, expected, "unexpected staged inventory under {root}");
+        }
+    });
+    drop(runtime);
+
+    let original_root = ObjectPath::from(ORIGINAL_ROOT);
+    let flow_acc_probe_root = ObjectPath::from(FLOW_ACC_PROBE_ROOT);
+    let original_url = Url::parse("s3://pourpoint-test/m3-s3/generated-512-original").unwrap();
+    let flow_acc_probe_url =
+        Url::parse("s3://pourpoint-test/m3-s3/generated-512-flow-acc-probe").unwrap();
+    let original_session =
+        DatasetSession::open_remote_with_store(store.clone(), &original_root, &original_url)
+            .expect("generated original remote session should open");
+    let flow_acc_probe_session =
+        DatasetSession::open_remote_with_store(store, &flow_acc_probe_root, &flow_acc_probe_url)
+            .expect("generated FlowAcc probe remote session should open");
+    let terminal = closed_terminal_polygon(0.983_333_333_333_333_3, 0.416_666_666_666_666_7);
+    let original_selection = original_session.select_d8_raster_for_terminal(&terminal);
+    let flow_acc_probe_selection = flow_acc_probe_session.select_d8_raster_for_terminal(&terminal);
+    if let (Err(flow_dir_error), Err(flow_acc_error)) =
+        (&original_selection, &flow_acc_probe_selection)
+    {
+        assert_eq!(flow_dir_error.to_string(), FLOW_DIR_RED_DIAGNOSTIC);
+        assert_eq!(flow_acc_error.to_string(), FLOW_ACC_RED_DIAGNOSTIC);
+        panic!("{FLOW_DIR_RED_DIAGNOSTIC}\n{FLOW_ACC_RED_DIAGNOSTIC}");
+    }
+    let (handle, native_terminal) =
+        original_selection.expect("out-of-line FlowDir and FlowAcc metadata should be accepted");
+    flow_acc_probe_selection.expect("out-of-line FlowAcc metadata should be accepted");
+    let native_bounds = native_terminal
+        .bounding_rect()
+        .expect("terminal polygon should have native bounds");
+    let localized_flow_dir = original_session
+        .localize_d8_raster_window(&handle, RasterKind::FlowDir, native_bounds)
+        .expect("generated out-of-line FlowDir window should localize");
+    let localized_flow_acc = original_session
+        .localize_d8_raster_window(&handle, RasterKind::FlowAcc, native_bounds)
+        .expect("generated out-of-line FlowAcc window should localize");
+    assert_eq!(localized_nodata(localized_flow_dir.path()), "128");
+    assert_eq!(localized_nodata(localized_flow_acc.path()), "nan");
+}
+
+#[derive(Clone, Copy)]
+enum GeneratedRaster {
+    FlowDirOutOfLine,
+    FlowDirInlineProbe,
+    FlowAccOutOfLine,
+}
+
+fn generated_manifest(source: &str, identity: &str) -> String {
+    let mut manifest: serde_json::Value = serde_json::from_str(source).unwrap();
+    manifest["fabric_name"] = serde_json::Value::String(format!("m3-s3-{identity}"));
+    manifest["adapter_version"] = serde_json::Value::String(format!("m3-s3-{identity}-v1"));
+    serde_json::to_string(&manifest).unwrap()
+}
+
+fn classic_tiled_tiff(kind: GeneratedRaster) -> Vec<u8> {
+    const IFD_OFFSET: u32 = 8;
+    const ENTRY_COUNT: u16 = 16;
+    const SCALE_OFFSET: u32 = 206;
+    const TIEPOINT_OFFSET: u32 = 230;
+    const OUT_OF_LINE_ASCII_OFFSET: u32 = 278;
+
+    let (bits_per_sample, sample_format, nodata, tile) = match kind {
+        GeneratedRaster::FlowDirOutOfLine => {
+            (8_u32, 2_u32, b"-128\0".as_slice(), vec![1_u8; 512 * 512])
+        }
+        GeneratedRaster::FlowDirInlineProbe => (8, 2, b"-1\0".as_slice(), vec![1_u8; 512 * 512]),
+        GeneratedRaster::FlowAccOutOfLine => {
+            let mut tile = Vec::with_capacity(512 * 512 * 4);
+            for _ in 0..512 * 512 {
+                tile.extend_from_slice(&1_i32.to_le_bytes());
+            }
+            (32, 2, b"-2147483648\0".as_slice(), tile)
+        }
+    };
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&tile).unwrap();
+    let compressed_tile = encoder.finish().unwrap();
+    let inline_nodata = nodata.len() <= 4;
+    let tile_offset = OUT_OF_LINE_ASCII_OFFSET
+        + if inline_nodata {
+            0
+        } else {
+            nodata.len() as u32
+        };
+    let tile_byte_count = u32::try_from(compressed_tile.len()).unwrap();
+    let nodata_value = if inline_nodata {
+        let mut bytes = [0_u8; 4];
+        bytes[..nodata.len()].copy_from_slice(nodata);
+        u32::from_le_bytes(bytes)
+    } else {
+        OUT_OF_LINE_ASCII_OFFSET
+    };
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42_u16.to_le_bytes());
+    bytes.extend_from_slice(&IFD_OFFSET.to_le_bytes());
+    bytes.extend_from_slice(&ENTRY_COUNT.to_le_bytes());
+    for (tag, field_type, count, value) in [
+        (256_u16, 4_u16, 1_u32, 512_u32),
+        (257, 4, 1, 512),
+        (258, 3, 1, bits_per_sample),
+        (259, 3, 1, 8),
+        (262, 3, 1, 1),
+        (277, 3, 1, 1),
+        (284, 3, 1, 1),
+        (317, 3, 1, 1),
+        (322, 4, 1, 512),
+        (323, 4, 1, 512),
+        (324, 4, 1, tile_offset),
+        (325, 4, 1, tile_byte_count),
+        (339, 3, 1, sample_format),
+        (33_550, 12, 3, SCALE_OFFSET),
+        (33_922, 12, 6, TIEPOINT_OFFSET),
+        (42_113, 2, nodata.len() as u32, nodata_value),
+    ] {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&field_type.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    for value in [1_000.0_f64, 1_000.0, 0.0] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in [0.0_f64, 0.0, 0.0, 0.0, 256_000.0, 0.0] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    if !inline_nodata {
+        bytes.extend_from_slice(nodata);
+    }
+    bytes.extend_from_slice(&compressed_tile);
+    bytes
+}
+
+fn closed_terminal_polygon(lon: f64, lat: f64) -> MultiPolygon<f64> {
+    let delta = 0.000_001;
+    MultiPolygon(vec![Polygon::new(
+        LineString::new(vec![
+            Coord {
+                x: lon - delta,
+                y: lat - delta,
+            },
+            Coord {
+                x: lon + delta,
+                y: lat - delta,
+            },
+            Coord {
+                x: lon + delta,
+                y: lat + delta,
+            },
+            Coord {
+                x: lon - delta,
+                y: lat + delta,
+            },
+            Coord {
+                x: lon - delta,
+                y: lat - delta,
+            },
+        ]),
+        Vec::new(),
+    )])
+}
+
+fn localized_nodata(path: &Path) -> String {
+    let file = std::fs::File::open(path).unwrap();
+    let mut decoder = Decoder::new(file).unwrap();
+    decoder.get_tag_ascii_string(Tag::GdalNodata).unwrap()
+}
+
+fn assert_remote_delineation_succeeds(session: DatasetSession) {
+    let engine = Engine::builder(session).build();
+    let result = engine
+        .delineate(GeoCoord::new(1.70, 0.20), &DelineationOptions::default())
+        .expect("remote Engine::delineate should succeed end-to-end");
+
+    assert_eq!(result.terminal_unit_id().get(), 3);
+    assert_eq!(result.upstream_unit_ids().len(), 3);
+    assert!(result.area_km2().as_f64() > 0.0);
+    assert!(
+        !result.geometry().0.is_empty(),
+        "watershed geometry should be assembled"
+    );
+    assert_eq!(
+        result.refinement(),
+        &RefinementOutcome::BestEffortSkipped {
+            provenance: BestEffortRefinementProvenance::new(
+                RefinementStrategyName::BestEffortD8IfPresent,
+                BestEffortSkipReason::CoarseUnitOnlyNoD8AuxDeclared
+            ),
+        },
+        "synthetic remote fixture intentionally has no D8 aux"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum RemoteFixture {
+    Full,
+    CatchmentsOnly,
+    D8Missing,
+}
+
+fn put_remote_fixture(store: &Arc<InMemory>, root: &ObjectPath, fixture: RemoteFixture) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        if matches!(fixture, RemoteFixture::Full | RemoteFixture::D8Missing) {
+            put_object(
+                store,
+                root,
+                "manifest.json",
+                PutPayload::from(if matches!(fixture, RemoteFixture::D8Missing) {
+                    manifest_with_missing_d8_bytes()
+                } else {
+                    manifest_bytes()
+                }),
+            )
+            .await;
+            put_object(
+                store,
+                root,
+                "graph.parquet",
+                PutPayload::from(graph_bytes()),
+            )
+            .await;
+        }
+        put_object(
+            store,
+            root,
+            "catchments.parquet",
+            PutPayload::from(catchments_bytes()),
+        )
+        .await;
+    });
+}
+
+async fn put_object(store: &Arc<InMemory>, root: &ObjectPath, name: &str, payload: PutPayload) {
+    store
+        .put(&root.clone().join(name), payload)
+        .await
+        .unwrap_or_else(|err| panic!("failed to put remote fixture artifact {name}: {err}"));
+}
+
+fn manifest_bytes() -> String {
+    serde_json::json!({
+        "format_version": "0.3.0",
+        "fabric_name": "testfabric",
+        "crs": "EPSG:4326",
+        "topology": "tree",
+        "bbox": [-180.0, -90.0, 180.0, 90.0],
+        "unit_count": 3,
+        "created_at": "2026-01-01T00:00:00Z",
+        "adapter_version": "test-v1",
+        "auxiliary": []
+    })
+    .to_string()
+}
+
+fn manifest_with_missing_d8_bytes() -> String {
+    serde_json::json!({
+        "format_version": "0.3.0",
+        "fabric_name": "testfabric",
+        "crs": "EPSG:4326",
+        "topology": "tree",
+        "bbox": [-180.0, -90.0, 180.0, 90.0],
+        "unit_count": 3,
+        "created_at": "2026-01-01T00:00:00Z",
+        "adapter_version": "test-v1",
+        "auxiliary": [{
+            "schema": "hfx.aux.d8_raster.v2",
+            "artifacts": {
+                "flow_dir": "missing-flow-dir.tif",
+                "flow_acc": "missing-flow-acc.tif"
+            },
+            "metadata": {
+                "crs": "EPSG:4326",
+                "flow_dir_encoding": "esri",
+                "flow_acc_units": "cells"
+            }
+        }]
+    })
+    .to_string()
+}
+
+fn graph_bytes() -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("level", DataType::Int16, false),
+        Field::new(
+            "upstream_ids",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            false,
+        ),
+        Field::new("bbox_minx", DataType::Float32, false),
+        Field::new("bbox_miny", DataType::Float32, false),
+        Field::new("bbox_maxx", DataType::Float32, false),
+        Field::new("bbox_maxy", DataType::Float32, false),
+    ]));
+
+    let id_arr = Int64Array::from(vec![1_i64, 2, 3]);
+    let mut level_b = Int16Builder::new();
+    let mut list_builder = ListBuilder::new(Int64Builder::new());
+    let mut minx_b = Float32Builder::new();
+    let mut miny_b = Float32Builder::new();
+    let mut maxx_b = Float32Builder::new();
+    let mut maxy_b = Float32Builder::new();
+    list_builder.append(true);
+    level_b.append_value(0);
+    minx_b.append_value(0.0);
+    miny_b.append_value(0.0);
+    maxx_b.append_value(0.9);
+    maxy_b.append_value(1.0);
+    list_builder.values().append_value(1);
+    list_builder.append(true);
+    level_b.append_value(0);
+    minx_b.append_value(0.95);
+    miny_b.append_value(0.0);
+    maxx_b.append_value(1.45);
+    maxy_b.append_value(0.5);
+    list_builder.values().append_value(2);
+    list_builder.append(true);
+    level_b.append_value(0);
+    minx_b.append_value(1.5);
+    miny_b.append_value(0.0);
+    maxx_b.append_value(2.0);
+    maxy_b.append_value(0.5);
+    let upstream_arr = list_builder.finish();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_arr),
+            Arc::new(level_b.finish()),
+            Arc::new(upstream_arr),
+            Arc::new(minx_b.finish()),
+            Arc::new(miny_b.finish()),
+            Arc::new(maxx_b.finish()),
+            Arc::new(maxy_b.finish()),
+        ],
+    )
+    .unwrap();
+
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = ArrowWriter::try_new(cursor, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.into_inner().unwrap().into_inner()
+}
+
+fn catchments_bytes() -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("level", DataType::Int16, false),
+        Field::new("parent_id", DataType::Int64, true),
+        Field::new("area_km2", DataType::Float32, false),
+        Field::new("up_area_km2", DataType::Float32, true),
+        Field::new("outlet_lon", DataType::Float64, false),
+        Field::new("outlet_lat", DataType::Float64, false),
+        bbox_struct_field(false),
+        Field::new("geometry", DataType::Binary, false),
+    ]));
+
+    let mut id_b = Int64Builder::new();
+    let mut level_b = Int16Builder::new();
+    let mut parent_id_b = Int64Builder::new();
+    let mut area_b = Float32Builder::new();
+    let mut up_area_b = Float32Builder::new();
+    let mut outlet_lon_b = Float64Builder::new();
+    let mut outlet_lat_b = Float64Builder::new();
+    let mut minx_b = Float32Builder::new();
+    let mut miny_b = Float32Builder::new();
+    let mut maxx_b = Float32Builder::new();
+    let mut maxy_b = Float32Builder::new();
+    let mut geom_b = BinaryBuilder::new();
+
+    for unit_id in 1..=3_i64 {
+        let minx = unit_id as f32 * 0.5;
+        let maxx = minx + 0.4;
+
+        id_b.append_value(unit_id);
+        level_b.append_value(0);
+        parent_id_b.append_null();
+        area_b.append_value(10.0);
+        up_area_b.append_null();
+        outlet_lon_b.append_value(f64::from((minx + maxx) / 2.0));
+        outlet_lat_b.append_value(0.2);
+        minx_b.append_value(minx);
+        miny_b.append_value(0.0);
+        maxx_b.append_value(maxx);
+        maxy_b.append_value(0.4);
+        geom_b.append_value(minimal_wkb_polygon(minx as f64, 0.0, maxx as f64, 0.4));
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_b.finish()),
+            Arc::new(level_b.finish()),
+            Arc::new(parent_id_b.finish()),
+            Arc::new(area_b.finish()),
+            Arc::new(up_area_b.finish()),
+            Arc::new(outlet_lon_b.finish()),
+            Arc::new(outlet_lat_b.finish()),
+            Arc::new(bbox_struct_array(
+                minx_b.finish(),
+                miny_b.finish(),
+                maxx_b.finish(),
+                maxy_b.finish(),
+            )),
+            Arc::new(geom_b.finish()),
+        ],
+    )
+    .unwrap();
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = ArrowWriter::try_new(cursor, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.into_inner().unwrap().into_inner()
+}
+
+fn minimal_wkb_polygon(minx: f64, miny: f64, maxx: f64, maxy: f64) -> Vec<u8> {
+    let mut wkb = Vec::new();
+    wkb.push(1u8);
+    wkb.extend_from_slice(&3u32.to_le_bytes());
+    wkb.extend_from_slice(&1u32.to_le_bytes());
+    wkb.extend_from_slice(&5u32.to_le_bytes());
+    for (x, y) in [
+        (minx, miny),
+        (maxx, miny),
+        (maxx, maxy),
+        (minx, maxy),
+        (minx, miny),
+    ] {
+        wkb.extend_from_slice(&x.to_le_bytes());
+        wkb.extend_from_slice(&y.to_le_bytes());
+    }
+    wkb
+}

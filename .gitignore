@@ -1,0 +1,25 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# Environment & local secrets
+.env
+*.env.local
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Logs & debugging
+*.log
+dhat-heap.json
+
+# Local large geospatial datasets / caches
+*.parquet
+*.arrow
+*.tif
+*.tiff
+grit-hfx*/
+hfx*/
+datasets/

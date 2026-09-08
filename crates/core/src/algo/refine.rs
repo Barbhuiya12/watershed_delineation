@@ -1,0 +1,1689 @@
+//! Terminal unit raster refinement.
+//!
+//! terminalCarve : TerminalPolygon × OutletAuthority × D8 → TerminalSubpolygon
+//!
+//! Rasterizes and masks the terminal, derives a seed without relocating vector
+//! authority, traces upstream cells, and polygonizes the contained carve.
+//!
+//! # Semantic divergence from hydra-shed
+//!
+//! The original `high_res_path` in hydra-shed masks only the accumulation tile
+//! (to constrain snapping) and traces on the **unmasked** flow direction tile,
+//! allowing the refined polygon to extend beyond the coarse terminal boundary.
+//!
+//! This implementation masks **both** tiles, so the trace is strictly contained
+//! within the terminal polygon. This guarantees the refined polygon is a
+//! sub-polygon of the coarse terminal, preventing overlap with upstream units
+//! in Component 6's dissolve step. The tradeoff is that raster-supported area
+//! outside the coarse boundary is lost — if the coarse polygon is too tight,
+//! refinement can only shrink, never correct outward.
+
+use geo::{BoundingRect, MultiPolygon};
+use hfx::{FlowAccumulationUnits, FlowDirEncoding};
+use tracing::{debug, info, instrument};
+
+use crate::algo::accumulation_tile::AccumulationTile;
+use crate::algo::catchment_mask::CatchmentMask;
+use crate::algo::flow_direction_tile::FlowDirectionTile;
+use crate::algo::polygonize::polygonize;
+use crate::algo::projection::{NativeCoord, ProjectionError};
+use crate::algo::raster_tile::RasterTileError;
+use crate::algo::rasterize::rasterize_multi_polygon;
+use crate::algo::snap::{
+    GridMappingError, SnapError, SnappedPoint, effective_threshold, quantize_grid_cell,
+    snap_pour_point,
+};
+use crate::algo::snap_threshold::SnapThreshold;
+use crate::algo::tile_state::Raw;
+use crate::algo::trace::trace_upstream;
+use crate::algo::traits::{RasterSource, RasterSourceError};
+use crate::support_claims::d8_pair_is_compatible;
+
+/// Authority supplied to raster refinement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RasterOutlet {
+    /// A vector snap feature already chose the hydrological point.
+    VectorPoint(NativeCoord),
+    /// Containment chose only a terminal unit; the raster ranker must choose a cell.
+    UnitOnly(NativeCoord),
+}
+
+/// The raster seed rule used for an applied carve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RasterSeedKind {
+    /// Unique cell containing the authoritative vector point.
+    VectorQuantized,
+    /// Winner of the threshold candidate ranker for unit-only containment.
+    RasterRanked,
+}
+
+/// Failed conjunct in the vector-cell usability guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorOutletGuardFailureKind {
+    /// The projected vector point did not map into the localized half-open raster window.
+    GridMapping,
+    /// The mapped cell is outside the rasterized terminal mask.
+    OutsideTerminalMask,
+    /// The mapped cell has neither a valid D8 direction nor valid terminal semantics.
+    UndefinedFlowDirection,
+    /// The mapped cell has no raw accumulation value.
+    UndefinedAccumulation,
+    /// The mapped cell accumulation is below the effective threshold.
+    BelowThreshold,
+}
+
+/// Complete evidence for a rejected authoritative vector cell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorOutletGuardFailure {
+    /// Failed guard conjunct.
+    pub kind: VectorOutletGuardFailureKind,
+    /// Requested threshold in upstream cells.
+    pub requested_threshold: SnapThreshold,
+    /// Effective threshold in the declared accumulation units.
+    pub effective_threshold: f32,
+    /// Declared accumulation units.
+    pub units: FlowAccumulationUnits,
+    /// Mapped cell when grid mapping succeeded.
+    pub mapped_cell: Option<crate::algo::coord::GridCoord>,
+    /// Raw accumulation when it was defined.
+    pub measured_accumulation: Option<f32>,
+}
+
+/// Errors from terminal unit raster refinement.
+#[derive(Debug, thiserror::Error)]
+pub enum RefinementError {
+    /// Flow direction and accumulation tiles have different grid dimensions.
+    #[error(
+        "tile dimension mismatch: flow_dir is {fd_rows}x{fd_cols}, accumulation is {acc_rows}x{acc_cols}"
+    )]
+    DimensionMismatch {
+        /// Number of rows in the flow direction tile.
+        fd_rows: usize,
+        /// Number of columns in the flow direction tile.
+        fd_cols: usize,
+        /// Number of rows in the accumulation tile.
+        acc_rows: usize,
+        /// Number of columns in the accumulation tile.
+        acc_cols: usize,
+    },
+
+    /// Flow direction and accumulation tiles have the same dimensions but
+    /// different geo-transforms (origin or pixel size).
+    #[error(
+        "tile geo-transform mismatch: tiles share {rows}x{cols} dims but have different origins or pixel sizes"
+    )]
+    GeoTransformMismatch {
+        /// Shared row count.
+        rows: usize,
+        /// Shared column count.
+        cols: usize,
+    },
+
+    /// The terminal polygon has no bounding rectangle (degenerate or empty geometry).
+    ///
+    /// Only produced by the loader wrapper [`refine_terminal_from_source`].
+    #[error("terminal polygon has no bounding rectangle (degenerate or empty geometry)")]
+    DegenerateTerminalPolygon,
+
+    /// Rasterizing the terminal polygon produced an all-false mask.
+    #[error("terminal polygon produced an empty raster mask ({rows}x{cols} tile)")]
+    EmptyRasterMask {
+        /// Number of rows in the tile.
+        rows: usize,
+        /// Number of columns in the tile.
+        cols: usize,
+    },
+
+    /// Masking a raster tile failed due to a dimension mismatch.
+    #[error("mask application failed: {source}")]
+    MaskFailed {
+        /// The underlying raster tile error.
+        source: RasterTileError,
+    },
+
+    /// Pour-point snapping failed within the masked accumulation tile.
+    #[error("pour-point snap failed: {source}")]
+    SnapFailed {
+        /// The underlying snap error.
+        source: SnapError,
+    },
+
+    /// The authoritative vector point could not provide a usable containing raster cell.
+    #[error("authoritative vector outlet cell failed usability guard: {failure:?}")]
+    VectorOutletUnusable {
+        /// Complete guard evidence with absence-aware optional measurements.
+        failure: VectorOutletGuardFailure,
+    },
+
+    /// Polygonizing the traced catchment mask produced no geometry.
+    #[error("trace mask polygonization produced no geometry")]
+    EmptyPolygonization,
+
+    /// Raster source failed to load a tile (only from loader wrapper).
+    #[error("failed to load raster tile: {source}")]
+    RasterLoad {
+        /// The underlying raster source error.
+        source: RasterSourceError,
+    },
+
+    /// Fired when km2 accumulation is declared for a geographic raster whose pixel area is angular.
+    #[error(
+        "flow accumulation units {units} require projected pixel area, but EPSG:{epsg} is geographic"
+    )]
+    GeographicKm2Unsupported {
+        /// Numeric declared EPSG identifier.
+        epsg: u32,
+        /// Declared flow-accumulation units.
+        units: FlowAccumulationUnits,
+    },
+
+    /// Fired when a native carved vertex or snapped outlet cannot be transformed back to EPSG:4326.
+    #[error("failed to inverse-project refined output from EPSG:{epsg}: {source}")]
+    InverseProjection {
+        /// Numeric native CRS identifier.
+        epsg: u32,
+        /// Inverse projection failure.
+        source: ProjectionError,
+    },
+}
+
+impl From<SnapError> for RefinementError {
+    fn from(source: SnapError) -> Self {
+        RefinementError::SnapFailed { source }
+    }
+}
+
+impl From<RasterSourceError> for RefinementError {
+    fn from(source: RasterSourceError) -> Self {
+        RefinementError::RasterLoad { source }
+    }
+}
+
+/// Result of a successful terminal unit refinement.
+#[derive(Debug, Clone)]
+pub struct RefinementResult {
+    snapped_point: SnappedPoint,
+    seed_kind: RasterSeedKind,
+    polygon: MultiPolygon<f64>,
+}
+
+impl RefinementResult {
+    /// Returns a reference to the snapped pour point.
+    pub fn snapped_point(&self) -> &SnappedPoint {
+        &self.snapped_point
+    }
+
+    /// Returns the native coordinate of the snapped pour point.
+    pub fn snapped_coord(&self) -> NativeCoord {
+        self.snapped_point.coord()
+    }
+
+    /// Return the rule that produced the raster seed.
+    pub fn seed_kind(&self) -> RasterSeedKind {
+        self.seed_kind
+    }
+
+    /// Returns a reference to the refined watershed polygon.
+    pub fn polygon(&self) -> &MultiPolygon<f64> {
+        &self.polygon
+    }
+
+    /// Consumes `self` and returns the refined watershed polygon.
+    pub fn into_polygon(self) -> MultiPolygon<f64> {
+        self.polygon
+    }
+}
+
+/// Refine a terminal polygon into a precise watershed polygon.
+///
+/// Rasterizes `terminal_polygon` onto the raster grid. Vector authority is mapped
+/// once to its containing usable cell. Unit-only authority uses the existing
+/// threshold candidate ranker. Callers must choose the authority variant
+/// explicitly. The function then masks, traces upstream from the selected seed,
+/// and polygonizes in raster-native coordinates.
+///
+/// # Errors
+///
+/// | Condition | Error |
+/// |-----------|-------|
+/// | Flow-dir and accumulation tiles have different dims | [`RefinementError::DimensionMismatch`] |
+/// | Flow-dir and accumulation tiles have different geo-transforms | [`RefinementError::GeoTransformMismatch`] |
+/// | Terminal polygon rasterizes to an empty mask | [`RefinementError::EmptyRasterMask`] |
+/// | Tile masking fails due to dimension mismatch | [`RefinementError::MaskFailed`] |
+/// | Unit-only authority has no threshold candidate | [`RefinementError::SnapFailed`] |
+/// | Vector authority cannot map to a usable containing cell | [`RefinementError::VectorOutletUnusable`] |
+/// | Trace mask polygonizes to nothing | [`RefinementError::EmptyPolygonization`] |
+///
+/// # Design note — boundary containment
+///
+/// Both tiles are masked to the terminal polygon before tracing. This means
+/// the refined polygon is always a strict sub-polygon of the coarse terminal.
+/// If the coarse boundary is too tight relative to the raster-derived
+/// watershed, refinement cannot recover that area. See module-level
+/// documentation for the full rationale.
+#[instrument(skip(terminal_polygon, outlet, flow_dir, accumulation))]
+pub fn refine_terminal(
+    terminal_polygon: &MultiPolygon<f64>,
+    outlet: RasterOutlet,
+    flow_dir: FlowDirectionTile<Raw>,
+    accumulation: AccumulationTile<Raw>,
+    threshold: SnapThreshold,
+    flow_accumulation_units: FlowAccumulationUnits,
+    epsg: u32,
+) -> Result<RefinementResult, RefinementError> {
+    let crs_declaration = format!("EPSG:{epsg}");
+    let flow_accumulation_units_declaration = flow_accumulation_units.to_string();
+    if !d8_pair_is_compatible(&crs_declaration, &flow_accumulation_units_declaration) {
+        return Err(RefinementError::GeographicKm2Unsupported {
+            epsg,
+            units: flow_accumulation_units,
+        });
+    }
+    // Step 1: Validate tile alignment
+    let fd_dims = flow_dir.dims();
+    let acc_dims = accumulation.dims();
+    if fd_dims != acc_dims {
+        return Err(RefinementError::DimensionMismatch {
+            fd_rows: fd_dims.rows,
+            fd_cols: fd_dims.cols,
+            acc_rows: acc_dims.rows,
+            acc_cols: acc_dims.cols,
+        });
+    }
+    if flow_dir.geo() != accumulation.geo() {
+        return Err(RefinementError::GeoTransformMismatch {
+            rows: fd_dims.rows,
+            cols: fd_dims.cols,
+        });
+    }
+
+    // Step 2: Save geo and dims before consuming tiles.
+    let geo = *flow_dir.geo();
+    let dims = flow_dir.dims();
+
+    // Step 3: Rasterize terminal polygon and retain the unmasked membership evidence.
+    let mask_data = rasterize_multi_polygon(terminal_polygon, &geo, dims);
+    if !mask_data.iter().any(|&value| value) {
+        return Err(RefinementError::EmptyRasterMask {
+            rows: dims.rows,
+            cols: dims.cols,
+        });
+    }
+    let mask_cell_count = mask_data.iter().filter(|&&value| value).count();
+    debug!(
+        mask_cell_count,
+        rows = dims.rows,
+        cols = dims.cols,
+        "rasterized terminal polygon"
+    );
+    let catchment_mask = CatchmentMask::new(mask_data, dims);
+    let threshold_value = effective_threshold(threshold, flow_accumulation_units, &geo);
+
+    // Step 4: A vector point is quantized once and guarded before either tile is masked.
+    let vector_seed = match outlet {
+        RasterOutlet::VectorPoint(vector_point) => {
+            let mapped = quantize_grid_cell(vector_point, &geo, dims, epsg).map_err(
+                |_source: GridMappingError| RefinementError::VectorOutletUnusable {
+                    failure: VectorOutletGuardFailure {
+                        kind: VectorOutletGuardFailureKind::GridMapping,
+                        requested_threshold: threshold,
+                        effective_threshold: threshold_value,
+                        units: flow_accumulation_units,
+                        mapped_cell: None,
+                        measured_accumulation: None,
+                    },
+                },
+            )?;
+            let reject = |kind, measured_accumulation| RefinementError::VectorOutletUnusable {
+                failure: VectorOutletGuardFailure {
+                    kind,
+                    requested_threshold: threshold,
+                    effective_threshold: threshold_value,
+                    units: flow_accumulation_units,
+                    mapped_cell: Some(mapped),
+                    measured_accumulation,
+                },
+            };
+            if !catchment_mask.contains(mapped) {
+                return Err(reject(
+                    VectorOutletGuardFailureKind::OutsideTerminalMask,
+                    accumulation.get(mapped),
+                ));
+            }
+            if flow_dir.decoded_cell(mapped).is_none() {
+                return Err(reject(
+                    VectorOutletGuardFailureKind::UndefinedFlowDirection,
+                    accumulation.get(mapped),
+                ));
+            }
+            let measured = accumulation
+                .get(mapped)
+                .ok_or_else(|| reject(VectorOutletGuardFailureKind::UndefinedAccumulation, None))?;
+            if measured < threshold_value {
+                return Err(reject(
+                    VectorOutletGuardFailureKind::BelowThreshold,
+                    Some(measured),
+                ));
+            }
+            Some(SnappedPoint::new(
+                mapped,
+                geo.pixel_to_coord(mapped),
+                measured,
+            ))
+        }
+        RasterOutlet::UnitOnly(_) => None,
+    };
+
+    // Step 5: Mask both tiles to preserve terminal containment.
+    let masked_flow_dir = flow_dir
+        .apply_mask(&catchment_mask)
+        .map_err(|source| RefinementError::MaskFailed { source })?;
+    let masked_acc = accumulation
+        .apply_mask(&catchment_mask)
+        .map_err(|source| RefinementError::MaskFailed { source })?;
+
+    // Step 6: Containment authority uses the fixed candidate ranker. Vector authority never does.
+    let (snapped, seed_kind) = match (outlet, vector_seed) {
+        (RasterOutlet::VectorPoint(_), Some(seed)) => (seed, RasterSeedKind::VectorQuantized),
+        (RasterOutlet::UnitOnly(request_point), None) => (
+            snap_pour_point(
+                request_point,
+                &masked_acc,
+                threshold,
+                flow_accumulation_units,
+                epsg,
+            )?,
+            RasterSeedKind::RasterRanked,
+        ),
+        _ => unreachable!("outlet authority and prepared seed must agree"),
+    };
+    debug!(
+        row = snapped.row(),
+        col = snapped.col(),
+        x = snapped.x(),
+        y = snapped.y(),
+        accumulation = snapped.accumulation(),
+        ?seed_kind,
+        "selected terminal refinement seed"
+    );
+
+    // Step 8: Trace upstream on MASKED flow_dir
+    let trace_mask = trace_upstream(snapped.pixel(), &masked_flow_dir);
+
+    // Step 9: Polygonize
+    let polygon = polygonize(&trace_mask, &geo).ok_or(RefinementError::EmptyPolygonization)?;
+
+    info!(
+        polygon_components = polygon.0.len(),
+        snapped_x = snapped.x(),
+        snapped_y = snapped.y(),
+        "terminal refinement complete"
+    );
+
+    Ok(RefinementResult {
+        snapped_point: snapped,
+        seed_kind,
+        polygon,
+    })
+}
+
+/// Load raster tiles from a [`RasterSource`] and refine a terminal polygon.
+///
+/// Computes the bounding box of `terminal_polygon`, loads windowed tiles from
+/// `source`, decodes flow directions with the declared `flow_dir_encoding`,
+/// then delegates to [`refine_terminal`].
+///
+/// # Errors
+///
+/// | Condition | Error |
+/// |-----------|-------|
+/// | Terminal polygon has no bounding rect | [`RefinementError::DegenerateTerminalPolygon`] |
+/// | Raster source fails to load a tile | [`RefinementError::RasterLoad`] |
+/// | Any error from [`refine_terminal`] | (propagated) |
+#[instrument(skip(source, terminal_polygon, outlet))]
+#[allow(clippy::too_many_arguments)]
+pub fn refine_terminal_from_source(
+    source: &dyn RasterSource,
+    flow_dir_uri: &str,
+    flow_acc_uri: &str,
+    terminal_polygon: &MultiPolygon<f64>,
+    outlet: RasterOutlet,
+    threshold: SnapThreshold,
+    flow_accumulation_units: FlowAccumulationUnits,
+    epsg: u32,
+    flow_dir_encoding: FlowDirEncoding,
+) -> Result<RefinementResult, RefinementError> {
+    let bbox = terminal_polygon
+        .bounding_rect()
+        .ok_or(RefinementError::DegenerateTerminalPolygon)?;
+
+    let flow_dir = source.load_flow_direction(flow_dir_uri, &bbox, flow_dir_encoding)?;
+    let accumulation = source.load_accumulation(flow_acc_uri, &bbox)?;
+
+    refine_terminal(
+        terminal_polygon,
+        outlet,
+        flow_dir,
+        accumulation,
+        threshold,
+        flow_accumulation_units,
+        epsg,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use geo::{LineString, Polygon, Rect};
+    use hfx::FlowDirEncoding;
+
+    use super::*;
+    use crate::algo::coord::{GridCoord, GridDims};
+    use crate::algo::geo_transform::GeoTransform;
+    use crate::algo::projection::NativeCoord;
+    use crate::algo::raster_tile::RasterTile;
+    use crate::algo::traits::RasterSourceError;
+
+    fn simple_geo() -> GeoTransform {
+        GeoTransform::new(NativeCoord::new(0.0, 0.0), 1.0, -1.0)
+    }
+
+    fn make_flow_tile(rows: usize, cols: usize, values: &[u8]) -> FlowDirectionTile<Raw> {
+        let dims = GridDims::new(rows, cols);
+        let mut tile = FlowDirectionTile::new(dims, simple_geo(), FlowDirEncoding::Esri).unwrap();
+        for r in 0..rows {
+            for c in 0..cols {
+                tile.set_raw(GridCoord::new(r, c), values[r * cols + c]);
+            }
+        }
+        tile
+    }
+
+    fn make_flow_tile_with(
+        rows: usize,
+        cols: usize,
+        values: &[u8],
+        geo: GeoTransform,
+        encoding: FlowDirEncoding,
+    ) -> FlowDirectionTile<Raw> {
+        let dims = GridDims::new(rows, cols);
+        let mut tile = FlowDirectionTile::new(dims, geo, encoding).unwrap();
+        for r in 0..rows {
+            for c in 0..cols {
+                tile.set_raw(GridCoord::new(r, c), values[r * cols + c]);
+            }
+        }
+        tile
+    }
+
+    fn make_acc_tile(rows: usize, cols: usize, values: &[f32]) -> AccumulationTile<Raw> {
+        let dims = GridDims::new(rows, cols);
+        let raw = RasterTile::from_vec(values.to_vec(), dims, f32::NAN, simple_geo()).unwrap();
+        AccumulationTile::from_raw(raw)
+    }
+
+    fn make_acc_tile_with(
+        rows: usize,
+        cols: usize,
+        values: &[f32],
+        geo: GeoTransform,
+    ) -> AccumulationTile<Raw> {
+        let dims = GridDims::new(rows, cols);
+        let raw = RasterTile::from_vec(values.to_vec(), dims, f32::NAN, geo).unwrap();
+        AccumulationTile::from_raw(raw)
+    }
+
+    fn idx(row: usize, col: usize, width: usize) -> usize {
+        row * width + col
+    }
+
+    fn rect_polygon(x0: f64, y0: f64, x1: f64, y1: f64) -> MultiPolygon<f64> {
+        let poly = Polygon::new(
+            LineString::from(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]),
+            vec![],
+        );
+        MultiPolygon::new(vec![poly])
+    }
+
+    // ── Group A: Happy-path refinement ────────────────────────────────────────
+
+    #[test]
+    fn simple_convergent_5x5() {
+        #[rustfmt::skip]
+        let fd_values: [u8; 25] = [
+            // col:  0   1   2   3   4
+            /* r0 */ 2,  4,  4,  4,  8,
+            /* r1 */ 1,  2,  4,  8, 16,
+            /* r2 */ 1,  1,  4, 16, 16,
+            /* r3 */ 0,  0,  0,  0,  0,
+            /* r4 */ 0,  0,  0,  0,  0,
+        ];
+        let mut acc_values = [1.0_f32; 25];
+        acc_values[idx(2, 2, 5)] = 800.0; // (2,2) = 800
+
+        let flow_dir = make_flow_tile(5, 5, &fd_values);
+        let accumulation = make_acc_tile(5, 5, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 5.0, -5.0);
+        let outlet = NativeCoord::new(2.5, -2.5);
+        let threshold = SnapThreshold::new(500);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        let coord = result.snapped_coord();
+        assert!(
+            (coord.x() - 2.5).abs() < 1e-9,
+            "expected x=2.5, got {}",
+            coord.x()
+        );
+        assert!(
+            (coord.y() - (-2.5)).abs() < 1e-9,
+            "expected y=-2.5, got {}",
+            coord.y()
+        );
+
+        assert_eq!(result.polygon().0.len(), 1, "expected 1 polygon component");
+
+        use geo::algorithm::Area;
+        let area = result.polygon().unsigned_area();
+        assert!(
+            (area - 15.0).abs() < 0.001,
+            "expected area ~15.0, got {area}"
+        );
+    }
+
+    #[test]
+    fn snap_to_offset_pour_point() {
+        #[rustfmt::skip]
+        let fd_values: [u8; 25] = [
+            1, 1, 4, 0, 0,
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+        ];
+        let mut acc_values = [f32::NAN; 25];
+        acc_values[idx(0, 0, 5)] = 1.0;
+        acc_values[idx(0, 1, 5)] = 2.0;
+        acc_values[idx(0, 2, 5)] = 600.0;
+        acc_values[idx(1, 2, 5)] = 700.0;
+        acc_values[idx(2, 2, 5)] = 800.0;
+        acc_values[idx(3, 2, 5)] = 900.0;
+        acc_values[idx(4, 2, 5)] = 1000.0;
+
+        let flow_dir = make_flow_tile(5, 5, &fd_values);
+        let accumulation = make_acc_tile(5, 5, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 5.0, -5.0);
+        let outlet = NativeCoord::new(0.5, -0.5); // pixel (0,0)
+        let threshold = SnapThreshold::new(500);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        // Snaps to (0,2): nearest cell above 500
+        let coord = result.snapped_coord();
+        assert!(
+            (coord.x() - 2.5).abs() < 1e-9,
+            "expected x=2.5, got {}",
+            coord.x()
+        );
+        assert!(
+            (coord.y() - (-0.5)).abs() < 1e-9,
+            "expected y=-0.5, got {}",
+            coord.y()
+        );
+
+        use geo::algorithm::Area;
+        let area = result.polygon().unsigned_area();
+        // Cells (0,0), (0,1), (0,2) contribute; (0,0) and (0,1) trace upstream of (0,2)
+        assert!((area - 3.0).abs() < 0.001, "expected area ~3.0, got {area}");
+    }
+
+    #[test]
+    fn sub_polygon_within_terminal() {
+        // All flow south; acc increases downward along col 2
+        #[rustfmt::skip]
+        let fd_values: [u8; 25] = [
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+        ];
+        let mut acc_values = [f32::NAN; 25];
+        acc_values[idx(0, 2, 5)] = 100.0;
+        acc_values[idx(1, 2, 5)] = 200.0;
+        acc_values[idx(2, 2, 5)] = 300.0;
+        acc_values[idx(3, 2, 5)] = 400.0;
+        acc_values[idx(4, 2, 5)] = 600.0;
+
+        let flow_dir = make_flow_tile(5, 5, &fd_values);
+        let accumulation = make_acc_tile(5, 5, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 5.0, -5.0);
+        let outlet = NativeCoord::new(2.5, -2.5); // pixel (2,2)
+        let threshold = SnapThreshold::new(200);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        use geo::algorithm::Area;
+        let polygon_area = result.polygon().unsigned_area();
+        let terminal_area = terminal_polygon.unsigned_area();
+
+        assert!(
+            polygon_area < terminal_area,
+            "refined area {polygon_area} should be less than terminal area {terminal_area}"
+        );
+
+        // The refined polygon should be within the terminal polygon bounds
+        use geo::BoundingRect;
+        let terminal_bbox = terminal_polygon.bounding_rect().unwrap();
+        let refined_bbox = result.polygon().bounding_rect().unwrap();
+        assert!(
+            refined_bbox.min().x >= terminal_bbox.min().x - 1e-9,
+            "refined min_x {} outside terminal",
+            refined_bbox.min().x
+        );
+        assert!(
+            refined_bbox.max().x <= terminal_bbox.max().x + 1e-9,
+            "refined max_x {} outside terminal",
+            refined_bbox.max().x
+        );
+        assert!(
+            refined_bbox.min().y >= terminal_bbox.min().y - 1e-9,
+            "refined min_y {} outside terminal",
+            refined_bbox.min().y
+        );
+        assert!(
+            refined_bbox.max().y <= terminal_bbox.max().y + 1e-9,
+            "refined max_y {} outside terminal",
+            refined_bbox.max().y
+        );
+    }
+
+    #[test]
+    fn single_cell_result() {
+        // 3x3, all flow_dir = 0 (nodata), acc: center = 900, rest NaN
+        let fd_values = [0u8; 9];
+        let mut acc_values = [f32::NAN; 9];
+        acc_values[idx(1, 1, 3)] = 900.0;
+
+        let flow_dir = make_flow_tile(3, 3, &fd_values);
+        let accumulation = make_acc_tile(3, 3, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        use geo::algorithm::Area;
+        let area = result.polygon().unsigned_area();
+        assert!(
+            (area - 1.0).abs() < 0.001,
+            "expected area ~1.0 (single cell), got {area}"
+        );
+
+        let coord = result.snapped_coord();
+        assert!(
+            (coord.x() - 1.5).abs() < 1e-9,
+            "expected snapped x=1.5, got {}",
+            coord.x()
+        );
+        assert!(
+            (coord.y() - (-1.5)).abs() < 1e-9,
+            "expected snapped y=-1.5, got {}",
+            coord.y()
+        );
+    }
+
+    #[test]
+    fn full_tile_convergence() {
+        // 3x3 star convergence to (1,1)
+        #[rustfmt::skip]
+        let fd_values: [u8; 9] = [
+              2,   4,   8,
+              1,   4,  16,
+            128,  64,  32,
+        ];
+        let mut acc_values = [1.0_f32; 9];
+        acc_values[idx(1, 1, 3)] = 900.0;
+
+        let flow_dir = make_flow_tile(3, 3, &fd_values);
+        let accumulation = make_acc_tile(3, 3, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        use geo::algorithm::Area;
+        let area = result.polygon().unsigned_area();
+        assert!((area - 9.0).abs() < 0.001, "expected area ~9.0, got {area}");
+
+        let coord = result.snapped_coord();
+        assert!(
+            (coord.x() - 1.5).abs() < 1e-9,
+            "expected snapped x=1.5, got {}",
+            coord.x()
+        );
+        assert!(
+            (coord.y() - (-1.5)).abs() < 1e-9,
+            "expected snapped y=-1.5, got {}",
+            coord.y()
+        );
+    }
+
+    // ── Group B: Snap behavior ────────────────────────────────────────────────
+
+    #[test]
+    fn nearest_wins_over_highest() {
+        // Column 2 flows south; acc decreasing downward
+        #[rustfmt::skip]
+        let fd_values: [u8; 25] = [
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+            0, 0, 4, 0, 0,
+        ];
+        let mut acc_values = [f32::NAN; 25];
+        acc_values[idx(0, 2, 5)] = 1000.0;
+        acc_values[idx(1, 2, 5)] = 900.0;
+        acc_values[idx(2, 2, 5)] = 800.0;
+        acc_values[idx(3, 2, 5)] = 700.0;
+        acc_values[idx(4, 2, 5)] = 600.0;
+
+        let flow_dir = make_flow_tile(5, 5, &fd_values);
+        let accumulation = make_acc_tile(5, 5, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 5.0, -5.0);
+        // Outlet near pixel (3,2): center is at x=2.5, y=-3.5
+        let outlet = NativeCoord::new(2.5, -3.5);
+        let threshold = SnapThreshold::new(500);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        // Nearest cell above 500 to (3,2) is (3,2) itself with acc=700
+        assert!(
+            (result.snapped_point().accumulation() - 700.0).abs() < 0.001,
+            "expected accumulation=700.0, got {}",
+            result.snapped_point().accumulation()
+        );
+    }
+
+    #[test]
+    fn tiebreak_by_accumulation() {
+        // 3x3: (1,0) flows E (1), (1,2) flows W (16). Both above threshold.
+        #[rustfmt::skip]
+        let fd_values: [u8; 9] = [
+            0,  0,  0,
+            1,  0, 16,
+            0,  0,  0,
+        ];
+        let mut acc_values = [f32::NAN; 9];
+        acc_values[idx(1, 0, 3)] = 600.0;
+        acc_values[idx(1, 2, 3)] = 800.0;
+
+        let flow_dir = make_flow_tile(3, 3, &fd_values);
+        let accumulation = make_acc_tile(3, 3, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        // Outlet at center, equidistant from (1,0) and (1,2)
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        // Higher acc wins on tie: (1,2) with 800.0
+        assert!(
+            (result.snapped_point().accumulation() - 800.0).abs() < 0.001,
+            "expected accumulation=800.0, got {}",
+            result.snapped_point().accumulation()
+        );
+    }
+
+    // ── Group C: Edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn outlet_on_polygon_edge() {
+        // 3x3, all flow S (4), acc: all 600
+        let fd_values = [4u8; 9];
+        let acc_values = [600.0_f32; 9];
+
+        let flow_dir = make_flow_tile(3, 3, &fd_values);
+        let accumulation = make_acc_tile(3, 3, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        // Outlet at top-left corner (0.0, 0.0)
+        let outlet = NativeCoord::new(0.0, 0.0);
+        let threshold = SnapThreshold::new(500);
+
+        // Should succeed: snap finds nearest valid cell
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        );
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn taudem_encoding() {
+        // 3x3 star convergence with TauDEM codes
+        // TauDEM: E=1, NE=2, N=3, NW=4, W=5, SW=6, S=7, SE=8
+        #[rustfmt::skip]
+        let fd_values: [u8; 9] = [
+            8, 7, 6,  // SE, S, SW
+            1, 7, 5,  // E, S, W
+            2, 3, 4,  // NE, N, NW
+        ];
+        let mut acc_values = [1.0_f32; 9];
+        acc_values[idx(1, 1, 3)] = 900.0;
+
+        let geo = simple_geo();
+        let flow_dir = make_flow_tile_with(3, 3, &fd_values, geo, FlowDirEncoding::Taudem);
+        let accumulation = make_acc_tile(3, 3, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        use geo::algorithm::Area;
+        let area = result.polygon().unsigned_area();
+        assert!(
+            (area - 9.0).abs() < 0.001,
+            "expected area ~9.0 (TauDEM), got {area}"
+        );
+    }
+
+    #[test]
+    fn non_unit_geo_transform() {
+        // 3x3 star convergence, ESRI, non-unit pixels
+        #[rustfmt::skip]
+        let fd_values: [u8; 9] = [
+              2,   4,   8,
+              1,   4,  16,
+            128,  64,  32,
+        ];
+        let mut acc_values = [1.0_f32; 9];
+        acc_values[idx(1, 1, 3)] = 900.0;
+
+        let geo = GeoTransform::new(NativeCoord::new(10.0, 50.0), 0.001, -0.001);
+        let flow_dir = make_flow_tile_with(3, 3, &fd_values, geo, FlowDirEncoding::Esri);
+        let accumulation = make_acc_tile_with(3, 3, &acc_values, geo);
+
+        // Terminal polygon covers [10.0, 10.003] x [49.997, 50.0]
+        let poly = Polygon::new(
+            LineString::from(vec![
+                (10.0_f64, 50.0_f64),
+                (10.003, 50.0),
+                (10.003, 49.997),
+                (10.0, 49.997),
+                (10.0, 50.0),
+            ]),
+            vec![],
+        );
+        let terminal_polygon = MultiPolygon::new(vec![poly]);
+
+        // Center of pixel (1,1): x = 10.0 + 1.5 * 0.001 = 10.0015, y = 50.0 - 1.5 * 0.001 = 49.9985
+        let outlet = NativeCoord::new(10.0015, 49.9985);
+        let threshold = SnapThreshold::new(500);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        let coord = result.snapped_coord();
+        assert!(
+            (coord.x() - 10.0015).abs() < 1e-9,
+            "expected x~10.0015, got {}",
+            coord.x()
+        );
+
+        use geo::algorithm::Area;
+        let area = result.polygon().unsigned_area();
+        let expected_area = 9.0 * 0.001 * 0.001;
+        assert!(
+            (area - expected_area).abs() < 1e-9,
+            "expected area~{expected_area}, got {area}"
+        );
+    }
+
+    // ── Group D: Complex topology ─────────────────────────────────────────────
+
+    #[test]
+    fn y_shaped_watershed() {
+        // 5x5: two branches merge at (2,2) then flow south
+        #[rustfmt::skip]
+        let fd_values: [u8; 25] = [
+            //  0   1   2   3   4
+               2,  0,  0,  0,  8,   // (0,0) SE, (0,4) SW
+               0,  2,  0,  8,  0,   // (1,1) SE, (1,3) SW
+               0,  0,  4,  0,  0,   // (2,2) S
+               0,  0,  4,  0,  0,
+               0,  0,  4,  0,  0,
+        ];
+        let mut acc_values = [f32::NAN; 25];
+        acc_values[idx(0, 0, 5)] = 1.0;
+        acc_values[idx(0, 4, 5)] = 1.0;
+        acc_values[idx(1, 1, 5)] = 2.0;
+        acc_values[idx(1, 3, 5)] = 2.0;
+        acc_values[idx(2, 2, 5)] = 600.0;
+        acc_values[idx(3, 2, 5)] = 700.0;
+        acc_values[idx(4, 2, 5)] = 800.0;
+
+        let flow_dir = make_flow_tile(5, 5, &fd_values);
+        let accumulation = make_acc_tile(5, 5, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 5.0, -5.0);
+        let outlet = NativeCoord::new(2.5, -2.5); // pixel (2,2)
+        let threshold = SnapThreshold::new(500);
+
+        let result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        use geo::algorithm::Area;
+        let area = result.polygon().unsigned_area();
+        assert!(
+            (area - 5.0).abs() < 0.001,
+            "expected Y-shape area ~5.0, got {area}"
+        );
+        // The five Y-shape cells are diagonally connected but not edge-adjacent,
+        // so polygonize produces one component per disconnected group.
+        assert!(
+            !result.polygon().0.is_empty(),
+            "expected at least 1 polygon component"
+        );
+    }
+
+    // ── Group E: Error paths ──────────────────────────────────────────────────
+
+    #[test]
+    fn no_cell_above_threshold() {
+        let fd_values = [4u8; 9];
+        let acc_values = [100.0_f32; 9];
+
+        let flow_dir = make_flow_tile(3, 3, &fd_values);
+        let accumulation = make_acc_tile(3, 3, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        let err = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RefinementError::SnapFailed {
+                source: SnapError::NoCellAboveThreshold {
+                    threshold: 500.0,
+                    units: FlowAccumulationUnits::Cells,
+                    epsg: 4326,
+                    outlet_x: 1.5,
+                    outlet_y: -1.5,
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn outlet_outside_tile() {
+        let fd_values = [4u8; 9];
+        let mut acc_values = [f32::NAN; 9];
+        acc_values[idx(1, 1, 3)] = 900.0;
+
+        let flow_dir = make_flow_tile(3, 3, &fd_values);
+        let accumulation = make_acc_tile(3, 3, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        // Outlet way outside
+        let outlet = NativeCoord::new(10.0, 10.0);
+        let threshold = SnapThreshold::new(500);
+
+        let err = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RefinementError::SnapFailed {
+                source: SnapError::OutletOutOfBounds {
+                    epsg: 4326,
+                    outlet_x: 10.0,
+                    outlet_y: 10.0,
+                    rows: 3,
+                    cols: 3,
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn all_masked_out_nan() {
+        // 3x3; acc: all NaN except (2,2)=800
+        // Terminal polygon covers only top-left 2x2: [0,2] x [0,-2]
+        let fd_values = [4u8; 9];
+        let mut acc_values = [f32::NAN; 9];
+        acc_values[idx(2, 2, 3)] = 800.0;
+
+        let flow_dir = make_flow_tile(3, 3, &fd_values);
+        let accumulation = make_acc_tile(3, 3, &acc_values);
+        // Terminal polygon covers only top-left 2x2 — masks out the one cell with acc
+        let terminal_polygon = rect_polygon(0.0, 0.0, 2.0, -2.0);
+        let outlet = NativeCoord::new(0.5, -0.5);
+        let threshold = SnapThreshold::new(500);
+
+        let err = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RefinementError::SnapFailed {
+                source: SnapError::NoCellAboveThreshold {
+                    threshold: 500.0,
+                    units: FlowAccumulationUnits::Cells,
+                    epsg: 4326,
+                    outlet_x: 0.5,
+                    outlet_y: -0.5,
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_raster_mask() {
+        // Terminal polygon entirely outside tile extent: [10,13] x [10,13]
+        let fd_values = [4u8; 9];
+        let acc_values = [1000.0_f32; 9];
+
+        let flow_dir = make_flow_tile(3, 3, &fd_values);
+        let accumulation = make_acc_tile(3, 3, &acc_values);
+        let terminal_polygon = rect_polygon(10.0, 10.0, 13.0, 13.0);
+        let outlet = NativeCoord::new(11.5, 11.5);
+        let threshold = SnapThreshold::new(500);
+
+        let err = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RefinementError::EmptyRasterMask { .. }),
+            "expected EmptyRasterMask, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn tile_dimension_mismatch() {
+        // flow_dir: 3x3, accumulation: 5x5 (different dims)
+        let fd_values = [4u8; 9];
+        let acc_values = [1000.0_f32; 25];
+
+        let flow_dir = make_flow_tile(3, 3, &fd_values);
+        // Use simple_geo for both but different dims
+        let acc_dims = GridDims::new(5, 5);
+        let raw =
+            RasterTile::from_vec(acc_values.to_vec(), acc_dims, f32::NAN, simple_geo()).unwrap();
+        let accumulation = AccumulationTile::from_raw(raw);
+
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        let err = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RefinementError::DimensionMismatch { .. }),
+            "expected DimensionMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn tile_geo_transform_mismatch() {
+        // Same dims (3x3) but different geo-transforms (different origins)
+        let fd_values = [4u8; 9];
+        let acc_values = [1000.0_f32; 9];
+
+        let geo_a = GeoTransform::new(NativeCoord::new(0.0, 0.0), 1.0, -1.0);
+        let geo_b = GeoTransform::new(NativeCoord::new(1.0, 1.0), 1.0, -1.0); // different origin
+
+        let flow_dir = make_flow_tile_with(3, 3, &fd_values, geo_a, FlowDirEncoding::Esri);
+        let accumulation = make_acc_tile_with(3, 3, &acc_values, geo_b);
+
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        let err = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir,
+            accumulation,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RefinementError::GeoTransformMismatch { .. }),
+            "expected GeoTransformMismatch, got {err:?}"
+        );
+    }
+
+    // ── Group F: Loader wrapper ───────────────────────────────────────────────
+
+    #[test]
+    fn loader_delegates_to_pure_function() {
+        // 3x3 star convergence (same as full_tile_convergence / A5)
+        #[rustfmt::skip]
+        let fd_values: [u8; 9] = [
+              2,   4,   8,
+              1,   4,  16,
+            128,  64,  32,
+        ];
+        let mut acc_values = [1.0_f32; 9];
+        acc_values[idx(1, 1, 3)] = 900.0;
+
+        let flow_dir_direct = make_flow_tile(3, 3, &fd_values);
+        let accumulation_direct = make_acc_tile(3, 3, &acc_values);
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        let direct_result = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            flow_dir_direct,
+            accumulation_direct,
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+        )
+        .unwrap();
+
+        struct MockRasterSource {
+            flow_dir: FlowDirectionTile<Raw>,
+            accumulation: AccumulationTile<Raw>,
+        }
+
+        impl RasterSource for MockRasterSource {
+            fn load_flow_direction(
+                &self,
+                _uri: &str,
+                _bbox: &Rect<f64>,
+                _encoding: FlowDirEncoding,
+            ) -> Result<FlowDirectionTile<Raw>, RasterSourceError> {
+                Ok(self.flow_dir.clone())
+            }
+
+            fn load_accumulation(
+                &self,
+                _uri: &str,
+                _bbox: &Rect<f64>,
+            ) -> Result<AccumulationTile<Raw>, RasterSourceError> {
+                Ok(self.accumulation.clone())
+            }
+        }
+
+        let source = MockRasterSource {
+            flow_dir: make_flow_tile(3, 3, &fd_values),
+            accumulation: make_acc_tile(3, 3, &acc_values),
+        };
+
+        let loader_result = refine_terminal_from_source(
+            &source,
+            "flow.tif",
+            "acc.tif",
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+            FlowDirEncoding::Esri,
+        )
+        .unwrap();
+
+        let direct_coord = direct_result.snapped_coord();
+        let loader_coord = loader_result.snapped_coord();
+        assert!(
+            (direct_coord.x() - loader_coord.x()).abs() < 1e-9,
+            "snapped x mismatch: direct={}, loader={}",
+            direct_coord.x(),
+            loader_coord.x()
+        );
+        assert!(
+            (direct_coord.y() - loader_coord.y()).abs() < 1e-9,
+            "snapped y mismatch: direct={}, loader={}",
+            direct_coord.y(),
+            loader_coord.y()
+        );
+
+        use geo::algorithm::Area;
+        let direct_area = direct_result.polygon().unsigned_area();
+        let loader_area = loader_result.polygon().unsigned_area();
+        assert!(
+            (direct_area - loader_area).abs() < 0.001,
+            "area mismatch: direct={direct_area}, loader={loader_area}"
+        );
+    }
+
+    #[test]
+    fn loader_propagates_raster_source_error() {
+        struct FailingRasterSource;
+
+        impl RasterSource for FailingRasterSource {
+            fn load_flow_direction(
+                &self,
+                _uri: &str,
+                _bbox: &Rect<f64>,
+                _encoding: FlowDirEncoding,
+            ) -> Result<FlowDirectionTile<Raw>, RasterSourceError> {
+                Err(RasterSourceError::FileNotFound {
+                    path: "flow.tif".into(),
+                })
+            }
+
+            fn load_accumulation(
+                &self,
+                _uri: &str,
+                _bbox: &Rect<f64>,
+            ) -> Result<AccumulationTile<Raw>, RasterSourceError> {
+                Err(RasterSourceError::FileNotFound {
+                    path: "acc.tif".into(),
+                })
+            }
+        }
+
+        let terminal_polygon = rect_polygon(0.0, 0.0, 3.0, -3.0);
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        let err = refine_terminal_from_source(
+            &FailingRasterSource,
+            "flow.tif",
+            "acc.tif",
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+            FlowDirEncoding::Esri,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, RefinementError::RasterLoad { .. }),
+            "expected RasterLoad, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn loader_preserves_directional_nodata_source_error() {
+        struct DirectionalNodataRasterSource;
+
+        impl RasterSource for DirectionalNodataRasterSource {
+            fn load_flow_direction(
+                &self,
+                _uri: &str,
+                _bbox: &Rect<f64>,
+                _encoding: FlowDirEncoding,
+            ) -> Result<FlowDirectionTile<Raw>, RasterSourceError> {
+                Err(RasterSourceError::InvalidFlowDirectionNodata {
+                    nodata: 1,
+                    encoding: FlowDirEncoding::Esri,
+                })
+            }
+
+            fn load_accumulation(
+                &self,
+                _uri: &str,
+                _bbox: &Rect<f64>,
+            ) -> Result<AccumulationTile<Raw>, RasterSourceError> {
+                unreachable!("flow-direction rejection must stop loading first")
+            }
+        }
+
+        let err = refine_terminal_from_source(
+            &DirectionalNodataRasterSource,
+            "flow.tif",
+            "acc.tif",
+            &rect_polygon(0.0, 0.0, 3.0, -3.0),
+            RasterOutlet::UnitOnly(NativeCoord::new(1.5, -1.5)),
+            SnapThreshold::new(500),
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+            FlowDirEncoding::Esri,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RefinementError::RasterLoad {
+                source: RasterSourceError::InvalidFlowDirectionNodata {
+                    nodata: 1,
+                    encoding: FlowDirEncoding::Esri,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn loader_computes_correct_bbox() {
+        use std::sync::Mutex;
+
+        // 3x3 star convergence
+        #[rustfmt::skip]
+        let fd_values: [u8; 9] = [
+              2,   4,   8,
+              1,   4,  16,
+            128,  64,  32,
+        ];
+        let mut acc_values = [1.0_f32; 9];
+        acc_values[idx(1, 1, 3)] = 900.0;
+
+        struct BboxCapturingSource {
+            flow_dir: FlowDirectionTile<Raw>,
+            accumulation: AccumulationTile<Raw>,
+            captured_bbox: Mutex<Option<Rect<f64>>>,
+        }
+
+        impl RasterSource for BboxCapturingSource {
+            fn load_flow_direction(
+                &self,
+                _uri: &str,
+                bbox: &Rect<f64>,
+                _encoding: FlowDirEncoding,
+            ) -> Result<FlowDirectionTile<Raw>, RasterSourceError> {
+                *self.captured_bbox.lock().unwrap() = Some(*bbox);
+                Ok(self.flow_dir.clone())
+            }
+
+            fn load_accumulation(
+                &self,
+                _uri: &str,
+                _bbox: &Rect<f64>,
+            ) -> Result<AccumulationTile<Raw>, RasterSourceError> {
+                Ok(self.accumulation.clone())
+            }
+        }
+
+        let source = BboxCapturingSource {
+            flow_dir: make_flow_tile(3, 3, &fd_values),
+            accumulation: make_acc_tile(3, 3, &acc_values),
+            captured_bbox: Mutex::new(None),
+        };
+
+        // Terminal polygon: [1.0, 4.0] x [-1.0, -4.0]
+        let terminal_polygon = rect_polygon(1.0, -1.0, 4.0, -4.0);
+        let outlet = NativeCoord::new(1.5, -1.5);
+        let threshold = SnapThreshold::new(500);
+
+        // We don't care about the result (the mock tiles don't match the bbox),
+        // just that the bbox was computed correctly from the polygon geometry.
+        let _ = refine_terminal_from_source(
+            &source,
+            "flow.tif",
+            "acc.tif",
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(outlet),
+            threshold,
+            FlowAccumulationUnits::Cells,
+            4326_u32,
+            FlowDirEncoding::Esri,
+        );
+
+        let captured = source.captured_bbox.lock().unwrap().unwrap();
+        // BoundingRect of rect_polygon(1.0, -1.0, 4.0, -4.0) should be:
+        // min: (1.0, -4.0), max: (4.0, -1.0)
+        assert!(
+            (captured.min().x - 1.0).abs() < 1e-9,
+            "expected bbox min_x=1.0, got {}",
+            captured.min().x
+        );
+        assert!(
+            (captured.min().y - (-4.0)).abs() < 1e-9,
+            "expected bbox min_y=-4.0, got {}",
+            captured.min().y
+        );
+        assert!(
+            (captured.max().x - 4.0).abs() < 1e-9,
+            "expected bbox max_x=4.0, got {}",
+            captured.max().x
+        );
+        assert!(
+            (captured.max().y - (-1.0)).abs() < 1e-9,
+            "expected bbox max_y=-1.0, got {}",
+            captured.max().y
+        );
+    }
+
+    #[test]
+    fn loader_forwards_bbox_accumulation_units_and_epsg() {
+        use std::sync::Mutex;
+
+        struct CapturingSource {
+            requests: Mutex<Vec<Rect<f64>>>,
+        }
+
+        impl RasterSource for CapturingSource {
+            fn load_flow_direction(
+                &self,
+                _uri: &str,
+                bbox: &Rect<f64>,
+                encoding: FlowDirEncoding,
+            ) -> Result<FlowDirectionTile<Raw>, RasterSourceError> {
+                self.requests.lock().unwrap().push(*bbox);
+                Ok(make_flow_tile_with(
+                    1,
+                    1,
+                    &[0],
+                    GeoTransform::new(NativeCoord::new(0.0, 0.0), 30.0, -30.0),
+                    encoding,
+                ))
+            }
+
+            fn load_accumulation(
+                &self,
+                _uri: &str,
+                bbox: &Rect<f64>,
+            ) -> Result<AccumulationTile<Raw>, RasterSourceError> {
+                self.requests.lock().unwrap().push(*bbox);
+                let threshold_cells = 1_000_u32;
+                let threshold_km2 =
+                    threshold_cells as f64 * (30.0_f64 * -30.0_f64).abs() / 1_000_000.0;
+                let below_threshold = f32::from_bits((threshold_km2 as f32).to_bits() - 1);
+                Ok(make_acc_tile_with(
+                    1,
+                    1,
+                    &[below_threshold],
+                    GeoTransform::new(NativeCoord::new(0.0, 0.0), 30.0, -30.0),
+                ))
+            }
+        }
+
+        let source = CapturingSource {
+            requests: Mutex::new(Vec::new()),
+        };
+        let terminal_polygon = rect_polygon(0.0, 0.0, 30.0, -30.0);
+        let expected_bbox = terminal_polygon.bounding_rect().unwrap();
+        let threshold_cells = 1_000_u32;
+        let expected_threshold =
+            (threshold_cells as f64 * (30.0_f64 * -30.0_f64).abs() / 1_000_000.0) as f32;
+
+        let err = refine_terminal_from_source(
+            &source,
+            "flow.tif",
+            "acc.tif",
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(NativeCoord::new(15.0, -15.0)),
+            SnapThreshold::new(1_000),
+            FlowAccumulationUnits::Km2,
+            8857_u32,
+            FlowDirEncoding::Esri,
+        )
+        .expect_err("sample below the forwarded km2 threshold should fail");
+
+        assert_eq!(
+            source.requests.lock().unwrap().as_slice(),
+            &[expected_bbox, expected_bbox]
+        );
+        assert!(matches!(
+            err,
+            RefinementError::SnapFailed {
+                source: SnapError::NoCellAboveThreshold {
+                    threshold,
+                    units: FlowAccumulationUnits::Km2,
+                    epsg: 8857,
+                    outlet_x: 15.0,
+                    outlet_y: -15.0,
+                }
+            } if threshold == expected_threshold
+        ));
+    }
+
+    #[test]
+    fn geographic_km2_is_rejected_before_snapping() {
+        let terminal_polygon = rect_polygon(0.0, 0.0, 1.0, -1.0);
+        let flow_dir = make_flow_tile(1, 1, &[0]);
+        let accumulation = make_acc_tile(1, 1, &[1.0]);
+
+        let err = refine_terminal(
+            &terminal_polygon,
+            RasterOutlet::UnitOnly(NativeCoord::new(0.5, -0.5)),
+            flow_dir,
+            accumulation,
+            SnapThreshold::new(1),
+            FlowAccumulationUnits::Km2,
+            4326_u32,
+        )
+        .expect_err("geographic pixel area must not be approximated");
+
+        assert!(matches!(
+            err,
+            RefinementError::GeographicKm2Unsupported {
+                epsg: 4326,
+                units: FlowAccumulationUnits::Km2,
+            }
+        ));
+        assert_eq!(
+            err.to_string(),
+            "flow accumulation units km2 require projected pixel area, but EPSG:4326 is geographic"
+        );
+    }
+}

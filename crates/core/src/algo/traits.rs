@@ -1,0 +1,181 @@
+//! Trait boundaries for raster-native I/O and geometry repair capabilities.
+//!
+//! These traits are defined in `pourpoint-core` and implemented by `pourpoint-gdal`.
+
+use geo::{MultiPolygon, Rect};
+use hfx::FlowDirEncoding;
+
+use crate::algo::accumulation_tile::AccumulationTile;
+use crate::algo::clean_epsilon::CleanEpsilon;
+use crate::algo::flow_direction_tile::{FlowDirectionTile, FlowDirectionTileError};
+use crate::algo::tile_state::Raw;
+
+/// Errors from raster source operations.
+#[derive(Debug, thiserror::Error)]
+pub enum RasterSourceError {
+    /// Raster file not found on disk.
+    #[error("raster file not found: {path}")]
+    FileNotFound {
+        /// Absolute path to the missing raster file.
+        path: String,
+    },
+
+    /// Backend failed to open the raster dataset.
+    #[error("failed to open raster at {path}: {reason}")]
+    OpenFailed {
+        /// Path of the raster that could not be opened.
+        path: String,
+        /// Reason reported by the backend.
+        reason: String,
+    },
+
+    /// Backend failed to read raster data or rejected its declared sample type.
+    #[error("failed to read raster window from {path}: {reason}")]
+    ReadFailed {
+        /// Path of the raster that could not be read.
+        path: String,
+        /// Reason reported by the backend.
+        reason: String,
+    },
+
+    /// Requested window maps to a zero-size pixel region.
+    #[error("empty raster window for {path}")]
+    EmptyWindow {
+        /// Path of the raster for which the window collapsed.
+        path: String,
+    },
+
+    /// Tile construction failed after a successful read.
+    #[error("tile construction failed: {reason}")]
+    TileConstruction {
+        /// Reason why tile construction failed.
+        reason: String,
+    },
+
+    /// A flow-direction header declares a nodata byte that is a legal direction.
+    #[error(
+        "flow-direction nodata byte {nodata} decodes as a legal direction under {encoding:?} encoding"
+    )]
+    InvalidFlowDirectionNodata {
+        /// Header-derived nodata byte that collides with a legal direction.
+        nodata: u8,
+        /// Authoritative declared encoding used to interpret the byte.
+        encoding: FlowDirEncoding,
+    },
+}
+
+impl From<FlowDirectionTileError> for RasterSourceError {
+    fn from(source: FlowDirectionTileError) -> Self {
+        match source {
+            FlowDirectionTileError::DirectionalNodata { nodata, encoding } => {
+                Self::InvalidFlowDirectionNodata { nodata, encoding }
+            }
+        }
+    }
+}
+
+/// Errors from geometry repair operations.
+#[derive(Debug, thiserror::Error)]
+pub enum GeometryRepairError {
+    /// Backend geometry operation failed.
+    #[error("geometry repair failed: {reason}")]
+    BackendError {
+        /// Reason reported by the backend.
+        reason: String,
+    },
+
+    /// Expected polygon output, got something else.
+    #[error("expected polygon output, got {geometry_type}")]
+    UnexpectedGeometryType {
+        /// The WKT geometry type name returned by the backend.
+        geometry_type: String,
+    },
+
+    /// Geometry remains invalid after all repair attempts.
+    #[error("geometry remains invalid after repair")]
+    StillInvalid,
+}
+
+/// Load windowed raster tiles from GeoTIFF files or GDAL virtual paths.
+///
+/// The canonical implementation uses GDAL and lives in `pourpoint-gdal`.
+pub trait RasterSource {
+    /// Load `uri` within raster-native `bbox` coordinates and decode direction bytes
+    /// using the caller-supplied HFX declaration `encoding`.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`RasterSourceError::FileNotFound`] | Local file does not exist on disk |
+    /// | [`RasterSourceError::OpenFailed`] | Backend cannot open the dataset |
+    /// | [`RasterSourceError::ReadFailed`] | Backend cannot read the window or rejects its sample type |
+    /// | [`RasterSourceError::EmptyWindow`] | Bbox maps to zero pixels |
+    /// | [`RasterSourceError::TileConstruction`] | Tile construction fails after read |
+    /// | [`RasterSourceError::InvalidFlowDirectionNodata`] | Header nodata decodes as a legal direction under the declared encoding |
+    fn load_flow_direction(
+        &self,
+        uri: &str,
+        bbox: &Rect<f64>,
+        encoding: FlowDirEncoding,
+    ) -> Result<FlowDirectionTile<Raw>, RasterSourceError>;
+
+    /// Load flow accumulation values within raster-native `bbox` coordinates from `uri`.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`RasterSourceError::FileNotFound`] | Local file does not exist on disk |
+    /// | [`RasterSourceError::OpenFailed`] | Backend cannot open the dataset |
+    /// | [`RasterSourceError::ReadFailed`] | Backend cannot read the window or rejects its sample type |
+    /// | [`RasterSourceError::EmptyWindow`] | Bbox maps to zero pixels |
+    /// | [`RasterSourceError::TileConstruction`] | Tile construction fails after read |
+    fn load_accumulation(
+        &self,
+        uri: &str,
+        bbox: &Rect<f64>,
+    ) -> Result<AccumulationTile<Raw>, RasterSourceError>;
+}
+
+/// Repair invalid geometries using external geometry libraries.
+///
+/// The canonical implementation uses GDAL/GEOS and lives in `pourpoint-gdal`.
+pub trait GeometryRepair {
+    /// Validate and repair a multi-polygon, returning a geometrically valid result.
+    ///
+    /// # Errors
+    ///
+    /// | Variant | When |
+    /// |---|---|
+    /// | [`GeometryRepairError::BackendError`] | Backend geometry operation fails |
+    /// | [`GeometryRepairError::UnexpectedGeometryType`] | Backend returns a non-polygon type |
+    /// | [`GeometryRepairError::StillInvalid`] | Geometry remains invalid after repair |
+    fn repair(
+        &self,
+        geometry: MultiPolygon<f64>,
+        epsilon: CleanEpsilon,
+    ) -> Result<MultiPolygon<f64>, GeometryRepairError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use hfx::FlowDirEncoding;
+
+    use super::RasterSourceError;
+    use crate::algo::flow_direction_tile::FlowDirectionTileError;
+
+    #[test]
+    fn directional_nodata_construction_error_maps_without_erasure() {
+        assert!(matches!(
+            RasterSourceError::from(FlowDirectionTileError::DirectionalNodata {
+                nodata: 1,
+                encoding: FlowDirEncoding::Esri,
+            }),
+            RasterSourceError::InvalidFlowDirectionNodata {
+                nodata: 1,
+                encoding: FlowDirEncoding::Esri,
+            }
+        ));
+    }
+}

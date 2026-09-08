@@ -1,0 +1,36 @@
+[Unit]
+Description=INCLINE Watershed Delineation System & Morphometrics Engine
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/incline-watershed-system
+
+# Load environment configurations if present
+EnvironmentFile=-/etc/incline-watershed.env
+Environment=INCLINE_DATASET_PATH=/opt/datasets/grit-hfx-v0.3.0
+Environment=PORT=8787
+Environment=HOST=127.0.0.1
+Environment=RUST_BACKTRACE=1
+
+ExecStart=/opt/incline-watershed-system/target/release/incline-watershed-system
+
+Restart=always
+RestartSec=5s
+
+# Security hardening directives
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+LimitNOFILE=65535
+
+# Logging via journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=incline-watershed
+
+[Install]
+WantedBy=multi-user.target

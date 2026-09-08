@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    ".",
+    "crates/core",
+]
+
+[workspace.dependencies]
+hfx = "0.5.0"
+
+[package]
+name = "incline-watershed-system"
+version = "1.0.0"
+edition = "2024"
+authors = ["INCLINE Watershed Delineation Team <incline@iitmandi.ac.in>"]
+description = "High-performance hydrographic watershed delineation and morphometric analysis system"
+
+[[bin]]
+name = "incline-watershed-system"
+path = "src/main.rs"
+
+[dependencies]
+pourpoint-core = { path = "crates/core" }
+hfx = { workspace = true }
+serde_json = "1"
+geo = "0.29"

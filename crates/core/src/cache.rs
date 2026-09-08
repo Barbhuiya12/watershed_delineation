@@ -1,0 +1,543 @@
+//! Remote artifact cache for parsed HFX dataset metadata.
+
+use std::path::{Path, PathBuf};
+
+use bytes::Bytes;
+use hfx::{DrainageGraph, Manifest};
+use object_store::path::Path as ObjectPath;
+use tracing::{debug, warn};
+use url::Url;
+
+use crate::error::SessionError;
+use crate::reader;
+use crate::reader::id_index::IdIndex;
+use crate::reader::manifest::AuxDeclarations;
+
+const CACHE_ENV: &str = "HFX_CACHE_DIR";
+const CACHE_NAMESPACE: &str = "hfx";
+
+/// Cached remote artifacts that have already been parsed successfully.
+#[derive(Debug)]
+pub(crate) struct CachedRemoteArtifacts {
+    pub(crate) manifest: Manifest,
+    pub(crate) aux: AuxDeclarations,
+    pub(crate) graph: DrainageGraph,
+}
+
+/// Cache for the remote artifacts needed before parquet loading is supported.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteArtifactCache {
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ValidationSidecar {
+    #[serde(default)]
+    pub(crate) token_format_version: SidecarFormatVersion,
+    #[serde(default)]
+    pub(crate) validation_logic_version: ValidationLogicVersion,
+    #[serde(default)]
+    pub(crate) hfx_format_version: String,
+    #[serde(default)]
+    pub(crate) manifest: ArtifactMeta,
+    #[serde(default)]
+    pub(crate) graph: ArtifactMeta,
+    #[serde(default)]
+    pub(crate) catchments: ArtifactMeta,
+    #[serde(default)]
+    pub(crate) snaps: Vec<ArtifactMeta>,
+    #[serde(default)]
+    pub(crate) validated_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub(crate) struct SidecarFormatVersion(pub(crate) u32);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub(crate) struct ValidationLogicVersion(pub(crate) String);
+
+/// Bump when open-time referential validation semantics change.
+pub(crate) const VALIDATION_LOGIC_VERSION: &str = "r2-snap-membership-v2";
+const TOKEN_FORMAT_VERSION: SidecarFormatVersion = SidecarFormatVersion(2);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ArtifactMeta {
+    pub(crate) path: String,
+    pub(crate) etag: String,
+    pub(crate) size: u64,
+}
+
+impl ArtifactMeta {
+    pub(crate) fn from_parts(
+        path: impl Into<String>,
+        etag: Option<&str>,
+        size: u64,
+    ) -> Option<Self> {
+        etag.map(|etag| Self {
+            path: path.into(),
+            etag: etag.to_owned(),
+            size,
+        })
+    }
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct SourceIndexEntry {
+    source: String,
+    remote_root: String,
+    fabric_name: String,
+    adapter_version: String,
+}
+
+impl RemoteArtifactCache {
+    /// Return the configured cache rooted at `HFX_CACHE_DIR` or the platform
+    /// cache directory joined with `hfx`.
+    pub(crate) fn configured() -> Result<Self, SessionError> {
+        let root = match std::env::var_os(CACHE_ENV) {
+            Some(path) => PathBuf::from(path),
+            None => dirs::cache_dir()
+                .map(|path| path.join(CACHE_NAMESPACE))
+                .ok_or(SessionError::CacheRootUnavailable)?,
+        };
+
+        Ok(Self { root })
+    }
+
+    /// Return the filesystem root used by this cache.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn artifact_cache_dir(&self, fabric_name: &str, adapter_version: &str) -> PathBuf {
+        self.root.join(fabric_name).join(adapter_version)
+    }
+
+    pub(crate) fn id_index_path(
+        &self,
+        fabric_name: &str,
+        adapter_version: &str,
+        artifact: &str,
+    ) -> PathBuf {
+        IdIndex::cache_path(
+            &self
+                .artifact_cache_dir(fabric_name, adapter_version)
+                .join(artifact),
+        )
+    }
+
+    pub(crate) fn validation_sidecar_path(
+        &self,
+        fabric_name: &str,
+        adapter_version: &str,
+    ) -> PathBuf {
+        self.artifact_cache_dir(fabric_name, adapter_version)
+            .join("validated.json")
+    }
+
+    /// Return the parsed cache entry mapped to this exact remote source.
+    pub(crate) fn read_entry_for_source(
+        &self,
+        url: &Url,
+        remote_root: &ObjectPath,
+    ) -> Result<Option<CachedRemoteArtifacts>, SessionError> {
+        let index_path = self.source_index_path(url, remote_root);
+        if !index_path.is_file() {
+            return Ok(None);
+        }
+
+        let bytes = std::fs::read(&index_path)
+            .map_err(|source| SessionError::cache_io("read", &index_path, source))?;
+        let Ok(index) = serde_json::from_slice::<SourceIndexEntry>(&bytes) else {
+            debug!(
+                path = %index_path.display(),
+                "remote cache source index is not valid JSON; falling back to remote fetch"
+            );
+            return Ok(None);
+        };
+
+        if index.source != url.as_str() || index.remote_root != remote_root.as_ref() {
+            debug!(
+                path = %index_path.display(),
+                "remote cache source index key collision; falling back to remote fetch"
+            );
+            return Ok(None);
+        }
+
+        let cache_dir = self.artifact_cache_dir(&index.fabric_name, &index.adapter_version);
+
+        Ok(read_entry(&cache_dir))
+    }
+
+    /// Write parsed manifest and graph bytes and map them to this remote source.
+    pub(crate) fn write_manifest_graph(
+        &self,
+        url: &Url,
+        remote_root: &ObjectPath,
+        manifest: &Manifest,
+        manifest_bytes: &[u8],
+        graph_bytes: &Bytes,
+    ) -> Result<(), SessionError> {
+        let cache_dir = self.artifact_cache_dir(manifest.fabric_name(), manifest.adapter_version());
+
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|source| SessionError::cache_io("create_dir_all", &cache_dir, source))?;
+        write_cache_file(&cache_dir.join("manifest.json"), manifest_bytes)?;
+        write_cache_file(&cache_dir.join("graph.parquet"), graph_bytes.as_ref())?;
+        self.write_source_index(url, remote_root, manifest)?;
+
+        debug!(
+            fabric = manifest.fabric_name(),
+            adapter_version = manifest.adapter_version(),
+            path = %cache_dir.display(),
+            "remote manifest and graph cached"
+        );
+
+        Ok(())
+    }
+
+    fn write_source_index(
+        &self,
+        url: &Url,
+        remote_root: &ObjectPath,
+        manifest: &Manifest,
+    ) -> Result<(), SessionError> {
+        let index_dir = self.root.join(".sources");
+        std::fs::create_dir_all(&index_dir)
+            .map_err(|source| SessionError::cache_io("create_dir_all", &index_dir, source))?;
+
+        let index = SourceIndexEntry {
+            source: url.as_str().to_string(),
+            remote_root: remote_root.as_ref().to_string(),
+            fabric_name: manifest.fabric_name().to_string(),
+            adapter_version: manifest.adapter_version().to_string(),
+        };
+        let bytes = serde_json::to_vec(&index).map_err(|source| {
+            SessionError::cache_json(
+                "serialize source index",
+                &self.source_index_path(url, remote_root),
+                source,
+            )
+        })?;
+        write_cache_file(&self.source_index_path(url, remote_root), &bytes)
+    }
+
+    fn source_index_path(&self, url: &Url, remote_root: &ObjectPath) -> PathBuf {
+        let key = format!("{}\n{}", url.as_str(), remote_root.as_ref());
+        self.root
+            .join(".sources")
+            .join(format!("{:016x}.json", fnv1a64(key.as_bytes())))
+    }
+
+    pub(crate) fn read_validation_sidecar(
+        &self,
+        fabric_name: &str,
+        adapter_version: &str,
+    ) -> Option<ValidationSidecar> {
+        let path = self.validation_sidecar_path(fabric_name, adapter_version);
+        let bytes = std::fs::read(&path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    pub(crate) fn write_validation_sidecar_best_effort(
+        &self,
+        fabric_name: &str,
+        adapter_version: &str,
+        sidecar: &ValidationSidecar,
+    ) {
+        let path = self.validation_sidecar_path(fabric_name, adapter_version);
+        let result = (|| -> Result<(), SessionError> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|source| SessionError::cache_io("create_dir_all", parent, source))?;
+            }
+            let bytes = serde_json::to_vec(sidecar).map_err(|source| {
+                SessionError::cache_json("serialize validation sidecar", &path, source)
+            })?;
+            write_cache_file(&path, &bytes)
+        })();
+        if let Err(error) = result {
+            warn!(path = %path.display(), error = %error, "failed to write validation sidecar");
+        }
+    }
+}
+
+impl ValidationSidecar {
+    pub(crate) fn current(
+        hfx_format_version: impl Into<String>,
+        manifest: ArtifactMeta,
+        graph: ArtifactMeta,
+        catchments: ArtifactMeta,
+        snaps: Vec<ArtifactMeta>,
+    ) -> Self {
+        let mut snaps = snaps;
+        snaps.sort_by(|left, right| left.path.cmp(&right.path));
+        Self {
+            token_format_version: TOKEN_FORMAT_VERSION,
+            validation_logic_version: ValidationLogicVersion(VALIDATION_LOGIC_VERSION.to_owned()),
+            hfx_format_version: hfx_format_version.into(),
+            manifest,
+            graph,
+            catchments,
+            snaps,
+            validated_at: validated_at_unix_seconds(),
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        hfx_format_version: &str,
+        manifest: &ArtifactMeta,
+        graph: &ArtifactMeta,
+        catchments: &ArtifactMeta,
+        snaps: &[ArtifactMeta],
+    ) -> bool {
+        let mut sorted_snaps = snaps.to_vec();
+        sorted_snaps.sort_by(|left, right| left.path.cmp(&right.path));
+
+        self.token_format_version == TOKEN_FORMAT_VERSION
+            && self.validation_logic_version.0 == VALIDATION_LOGIC_VERSION
+            && self.hfx_format_version == hfx_format_version
+            && self.manifest == *manifest
+            && self.graph == *graph
+            && self.catchments == *catchments
+            && self.snaps == sorted_snaps
+    }
+}
+
+fn read_entry(path: &Path) -> Option<CachedRemoteArtifacts> {
+    let manifest_path = path.join("manifest.json");
+    let graph_path = path.join("graph.parquet");
+    if !manifest_path.is_file() || !graph_path.is_file() {
+        return None;
+    }
+
+    let manifest_bytes = std::fs::read(&manifest_path).ok()?;
+    let parsed = reader::manifest::read_manifest_from_bytes(&manifest_bytes).ok()?;
+    if !cache_key_matches(path, &parsed.manifest) {
+        return None;
+    }
+
+    let graph_bytes = Bytes::from(std::fs::read(&graph_path).ok()?);
+    let graph = reader::graph::load_graph_from_bytes(graph_bytes).ok()?;
+
+    Some(CachedRemoteArtifacts {
+        manifest: parsed.manifest,
+        aux: parsed.aux,
+        graph,
+    })
+}
+
+fn cache_key_matches(path: &Path, manifest: &Manifest) -> bool {
+    let adapter_version = path.file_name().and_then(|name| name.to_str());
+    let fabric_name = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str());
+
+    fabric_name == Some(manifest.fabric_name())
+        && adapter_version == Some(manifest.adapter_version())
+}
+
+fn write_cache_file(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
+    std::fs::write(path, bytes).map_err(|source| SessionError::cache_io("write", path, source))
+}
+
+fn validated_at_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArtifactMeta, RemoteArtifactCache, ValidationLogicVersion, ValidationSidecar};
+
+    fn artifact(path: &str, etag: &str, size: u64) -> ArtifactMeta {
+        ArtifactMeta {
+            path: path.into(),
+            etag: etag.into(),
+            size,
+        }
+    }
+
+    fn sidecar_with_two_snaps() -> ValidationSidecar {
+        ValidationSidecar::current(
+            "0.3.0",
+            artifact("manifest.json", "manifest-etag", 11),
+            artifact("graph.parquet", "graph-etag", 22),
+            artifact("catchments.parquet", "catch-etag", 33),
+            vec![
+                artifact("aux/snap-b.parquet", "snap-b-etag", 55),
+                artifact("aux/snap-a.parquet", "snap-a-etag", 44),
+            ],
+        )
+    }
+
+    fn token_inputs() -> (ArtifactMeta, ArtifactMeta, ArtifactMeta, Vec<ArtifactMeta>) {
+        (
+            artifact("manifest.json", "manifest-etag", 11),
+            artifact("graph.parquet", "graph-etag", 22),
+            artifact("catchments.parquet", "catch-etag", 33),
+            vec![
+                artifact("aux/snap-a.parquet", "snap-a-etag", 44),
+                artifact("aux/snap-b.parquet", "snap-b-etag", 55),
+            ],
+        )
+    }
+
+    #[test]
+    fn id_index_path_uses_artifact_cache_dir() {
+        let cache = RemoteArtifactCache {
+            root: "/tmp/cache".into(),
+        };
+
+        assert_eq!(
+            cache.id_index_path("fabric", "adapter", "catchments.parquet"),
+            std::path::Path::new("/tmp/cache/fabric/adapter/catchments.idindex.arrow")
+        );
+    }
+
+    #[test]
+    fn validation_sidecar_matches_exact_metadata_and_version() {
+        let (manifest, graph, catchments, snaps) = token_inputs();
+        let sidecar = sidecar_with_two_snaps();
+
+        assert!(sidecar.matches("0.3.0", &manifest, &graph, &catchments, &snaps));
+    }
+
+    #[test]
+    fn validation_sidecar_matches_absent_snap() {
+        let manifest = artifact("manifest.json", "manifest-etag", 11);
+        let graph = artifact("graph.parquet", "graph-etag", 22);
+        let catchments = artifact("catchments.parquet", "catch-etag", 33);
+        let sidecar = ValidationSidecar::current(
+            "0.3.0",
+            manifest.clone(),
+            graph.clone(),
+            catchments.clone(),
+            Vec::new(),
+        );
+
+        assert!(sidecar.matches("0.3.0", &manifest, &graph, &catchments, &[]));
+    }
+
+    #[test]
+    fn legacy_validation_sidecar_without_manifest_attestation_fails_closed() {
+        let legacy = serde_json::json!({
+            "catchments_etag": "catch-etag",
+            "catchments_size": 123,
+            "snap_etag": null,
+            "snap_size": null,
+            "validated_at": 1,
+            "pourpoint_version": env!("CARGO_PKG_VERSION")
+        });
+
+        let sidecar: ValidationSidecar = serde_json::from_value(legacy).unwrap();
+        let (manifest, graph, catchments, snaps) = token_inputs();
+
+        assert!(!sidecar.matches("0.3.0", &manifest, &graph, &catchments, &snaps));
+    }
+
+    #[test]
+    fn validation_sidecar_patch_version_change_does_not_invalidate_v2_token() {
+        let (manifest, graph, catchments, snaps) = token_inputs();
+        let mut serialized = serde_json::to_value(sidecar_with_two_snaps()).unwrap();
+        serialized["pourpoint_version"] = serde_json::json!("0.0.0-different-patch");
+        let sidecar: ValidationSidecar = serde_json::from_value(serialized).unwrap();
+
+        assert!(sidecar.matches("0.3.0", &manifest, &graph, &catchments, &snaps));
+    }
+
+    #[test]
+    fn validation_sidecar_logic_version_change_invalidates() {
+        let (manifest, graph, catchments, snaps) = token_inputs();
+        let mut sidecar = sidecar_with_two_snaps();
+        sidecar.validation_logic_version = ValidationLogicVersion("different-logic".into());
+
+        assert!(!sidecar.matches("0.3.0", &manifest, &graph, &catchments, &snaps));
+    }
+
+    #[test]
+    fn validation_sidecar_old_open_reuse_logic_version_fails_closed() {
+        let (manifest, graph, catchments, snaps) = token_inputs();
+        let mut sidecar = sidecar_with_two_snaps();
+        sidecar.validation_logic_version = ValidationLogicVersion("r2-open-reuse-v1".into());
+
+        assert!(!sidecar.matches("0.3.0", &manifest, &graph, &catchments, &snaps));
+    }
+
+    #[test]
+    fn validation_sidecar_artifact_metadata_changes_invalidate() {
+        let (manifest, graph, catchments, snaps) = token_inputs();
+        let sidecar = sidecar_with_two_snaps();
+
+        assert!(!sidecar.matches(
+            "0.3.0",
+            &artifact("manifest.json", "other-manifest", 11),
+            &graph,
+            &catchments,
+            &snaps
+        ));
+        assert!(!sidecar.matches(
+            "0.3.0",
+            &manifest,
+            &graph,
+            &artifact("catchments.parquet", "catch-etag", 34),
+            &snaps
+        ));
+        let changed_snap = vec![
+            artifact("aux/snap-a.parquet", "snap-a-etag", 44),
+            artifact("aux/snap-b.parquet", "snap-b-etag", 56),
+        ];
+        assert!(!sidecar.matches("0.3.0", &manifest, &graph, &catchments, &changed_snap));
+    }
+
+    #[test]
+    fn validation_sidecar_graph_metadata_mismatch_fails_closed() {
+        let (manifest, _graph, catchments, snaps) = token_inputs();
+        let sidecar = sidecar_with_two_snaps();
+
+        assert!(!sidecar.matches(
+            "0.3.0",
+            &manifest,
+            &artifact("graph.parquet", "other-graph", 22),
+            &catchments,
+            &snaps
+        ));
+        assert!(!sidecar.matches(
+            "0.3.0",
+            &manifest,
+            &artifact("graph.parquet", "graph-etag", 23),
+            &catchments,
+            &snaps
+        ));
+    }
+
+    #[test]
+    fn validation_sidecar_matches_two_snaps_regardless_of_declaration_order() {
+        let (manifest, graph, catchments, mut snaps) = token_inputs();
+        let sidecar = sidecar_with_two_snaps();
+        snaps.reverse();
+
+        assert_eq!(
+            sidecar.snaps,
+            vec![
+                artifact("aux/snap-a.parquet", "snap-a-etag", 44),
+                artifact("aux/snap-b.parquet", "snap-b-etag", 55),
+            ]
+        );
+        assert!(sidecar.matches("0.3.0", &manifest, &graph, &catchments, &snaps));
+    }
+}
