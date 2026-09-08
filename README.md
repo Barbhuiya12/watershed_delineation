@@ -8,7 +8,7 @@
 
 > **High-performance, publication-grade hydrographic watershed delineation and morphometric analysis engine for Indian river basins and global hydrography, powered by the [`pourpoint`](https://github.com/CooperBigFoot/pourpoint) engine (by Nicolas Lazaro).**
 
-Developed for **INCLINE (IIT Mandi)**, this system extends the `pourpoint` hydrographic engine to perform instantaneous watershed delineation, river network stream routing, and rigorous scientific morphometric characterization in **sub-100 milliseconds**.
+Developed by **Siddik Barbhuiya** and **Dr. Vivek Gupta** for **INCLINE (IIT Mandi)**, this system extends the `pourpoint` hydrographic engine to perform instantaneous watershed delineation, river network stream routing, and rigorous scientific morphometric characterization in **sub-100 milliseconds**.
 
 ---
 
@@ -235,14 +235,22 @@ This system builds upon and extends the exceptional open-source work of:
 
 ---
 
+## Development Team
+
+- **Siddik Barbhuiya** — Hydro-informatics & Geospatial Engineering (INCLINE, IIT Mandi)
+- **Dr. Vivek Gupta** — Assistant Professor, Hydrology & Water Resources (INCLINE, IIT Mandi)
+
+---
+
 ## Citation
 
 If you use this software for research or operational hydrologic forecasting, please cite both this system and the underlying `pourpoint` engine:
 
 ```bibtex
 @software{incline_watershed_2026,
-  author = {{INCLINE Hydrology Group, IIT Mandi}},
+  author = {Barbhuiya, Siddik and Gupta, Vivek},
   title = {INCLINE High-Performance Watershed Delineation and Morphometric Analysis System},
+  institution = {Indian Institute of Technology Mandi (IIT Mandi)},
   year = {2026},
   publisher = {GitHub},
   url = {https://github.com/Barbhuiya12/watershed_delineation}

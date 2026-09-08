@@ -12,7 +12,8 @@ name = "incline-watershed-system"
 version = "1.0.0"
 edition = "2024"
 authors = [
-    "INCLINE Watershed Delineation Team <incline@iitmandi.ac.in>",
+    "Siddik Barbhuiya <siddikbarbhuiya@gmail.com>",
+    "Vivek Gupta <vivek@iitmandi.ac.in>",
     "Nicolas Lazaro <pourpoint engine author>",
 ]
 description = "High-performance hydrographic watershed delineation and morphometric analysis system, built on the pourpoint engine (by Nicolas Lazaro)"

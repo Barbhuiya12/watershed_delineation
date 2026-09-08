@@ -1086,7 +1086,7 @@ button { font-family: inherit; }
         <div style="font-size: 11px; color: var(--text-dim); line-height: 1.6; border-top: 1px solid var(--border-default); padding-top: 12px;">
           Engine: <a href="https://github.com/CooperBigFoot/pourpoint" target="_blank" style="color: var(--primary); text-decoration: underline; font-weight: 600;">pourpoint</a> by Nicolas Lazaro<br>
           Hydrofabric: <strong>GRIT HFX 0.3.0</strong> · Upstream Tech<br>
-          System &amp; Morphometrics: <strong>INCLINE (IIT Mandi)</strong>
+          Team: <strong>Siddik Barbhuiya, Dr. Vivek Gupta</strong> (INCLINE, IIT Mandi)
         </div>
       </div>
     </aside>
@@ -1615,7 +1615,7 @@ function buildReportDOM(d, totalMs) {
 
     <div style="margin-top: 16px; padding: 10px 12px; background: var(--bg-hover); border-radius: 8px; font-size: 11px; color: var(--text-muted); line-height: 1.5; border: 1px solid var(--border-default);">
       Delineation &amp; DAG traversal powered by <a href="https://github.com/CooperBigFoot/pourpoint" target="_blank" style="color: var(--primary); font-weight: 600; text-decoration: none;">pourpoint</a> (by Nicolas Lazaro).<br>
-      Morphometrics &amp; Portal developed for INCLINE, IIT Mandi.
+      Developed by <strong>Siddik Barbhuiya &amp; Dr. Vivek Gupta</strong> (INCLINE, IIT Mandi).
     </div>
   `;
 }
@@ -1666,6 +1666,7 @@ function generateMorphometricsCsv(d, basinName) {
     ["Watershed Polygon Dissolve Time", "", numVal(d.timing.dissolve_s * 1000, 0), "ms", "WKB Union / PostGIS Topology"],
     ["Core Delineation Engine", "", "pourpoint-core (by Nicolas Lazaro)", "", "https://github.com/CooperBigFoot/pourpoint"],
     ["Global Hydrofabric Dataset", "", "GRIT HFX 0.3.0 (Upstream Tech)", "", "https://upstream.tech/"],
+    ["Development Team", "", "Siddik Barbhuiya & Dr. Vivek Gupta", "", "INCLINE, IIT Mandi"],
     ["Hydrological Platform", "", "INCLINE Watershed Delineation System", "", "https://incline.iitmandi.ac.in"]
   ];
 
