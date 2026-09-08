@@ -27,6 +27,10 @@ use pourpoint_core::resolver::{ResolverConfig, SearchRadiusMetres, SnapStrategy}
 use pourpoint_core::session::DatasetSession;
 use pourpoint_core::{DelineationOptions, Engine, LevelSelection, RefinementMode};
 use serde_json::{Value, json};
+use i_overlay::core::fill_rule::FillRule;
+use i_overlay::core::solver::Solver;
+use i_overlay::float::string_overlay::FloatStringOverlay;
+use i_overlay::string::clip::ClipRule;
 
 const INDEX_HTML: &str = include_str!("portal.html");
 const DEFAULT_PORT: u16 = 8787;
@@ -329,25 +333,28 @@ fn delineate(engine: &Engine, q: &HashMap<String, String>) -> (u16, Value) {
         result.geometry().clone()
     };
 
+    let shapes = multipolygon_to_shapes(&display_watershed);
+
     let reach_features: Vec<Value> = reaches
         .reaches()
         .iter()
-        .map(|reach| {
-            let geom = if tol > 0.0 {
-                simplify_geometry(reach.geometry(), tol)
-            } else {
-                reach.geometry().clone()
-            };
-            json!({
+        .filter_map(|reach| {
+            // Strictly clip reach linework against the watershed polygon boundary
+            let clipped = clip_reach_geometry(reach.geometry(), &shapes);
+            let geom_json = line_json(&clipped);
+            if geom_json.is_null() {
+                return None;
+            }
+            Some(json!({
                 "type": "Feature",
-                "geometry": line_json(&geom),
+                "geometry": geom_json,
                 "properties": {
                     "unit_id": reach.unit_id().get(),
                     "snap_id": reach.snap_id().get(),
                     "stem_role": reach.stem_role().map(|r| r.to_string()),
                     "length_km": reach.length().as_f64(),
                 }
-            })
+            }))
         })
         .collect();
 
@@ -406,19 +413,84 @@ fn delineate(engine: &Engine, q: &HashMap<String, String>) -> (u16, Value) {
     )
 }
 
-/// Douglas-Peucker tolerance in degrees for the geometry sent to the browser.
-///
-/// Every reported metric is computed on the FULL geometry before this runs —
-/// simplification is display-only. A continental basin returns tens of
-/// thousands of reaches, which a map cannot draw at full fidelity anyway, so
-/// the tolerance scales with extent: tight enough to be invisible at the zoom
-/// the basin is viewed at, loose enough to keep the payload sane.
-fn display_tolerance(area_km2: f64) -> f64 {
-    match area_km2 {
-        a if a < 1_000.0 => 0.0,     // small basins ship untouched
-        a if a < 10_000.0 => 0.0005, // ~55 m
-        a if a < 100_000.0 => 0.002, // ~220 m
-        _ => 0.005,                  // ~550 m
+/// Tolerance in degrees for boundary simplification. Set to 0.0 (full fidelity)
+/// so that the boundary matches the true watershed divide and reaches never protrude.
+fn display_tolerance(_area_km2: f64) -> f64 {
+    0.0
+}
+
+/// Convert a `geo::MultiPolygon<f64>` into `i_overlay` shapes `Vec<Vec<Vec<[f64; 2]>>>`.
+fn multipolygon_to_shapes(mp: &geo::MultiPolygon<f64>) -> Vec<Vec<Vec<[f64; 2]>>> {
+    mp.0.iter()
+        .map(|poly| {
+            let mut contours = Vec::with_capacity(1 + poly.interiors().len());
+            // Exterior ring
+            let ext: Vec<[f64; 2]> = poly.exterior().coords().map(|c| [c.x, c.y]).collect();
+            contours.push(ext);
+            // Interior rings (holes)
+            for interior in poly.interiors() {
+                let hole: Vec<[f64; 2]> = interior.coords().map(|c| [c.x, c.y]).collect();
+                contours.push(hole);
+            }
+            contours
+        })
+        .collect()
+}
+
+/// Clip a `geo::Geometry<f64>` against the watershed MultiPolygon shapes.
+/// Guaranteed to keep only lines and segments that lie strictly inside or on the boundary.
+fn clip_reach_geometry(
+    geom: &geo::Geometry<f64>,
+    shapes: &Vec<Vec<Vec<[f64; 2]>>>,
+) -> geo::Geometry<f64> {
+    let paths: Vec<Vec<[f64; 2]>> = match geom {
+        geo::Geometry::LineString(ls) => {
+            if ls.0.len() < 2 {
+                return geom.clone();
+            }
+            vec![ls.0.iter().map(|c| [c.x, c.y]).collect()]
+        }
+        geo::Geometry::MultiLineString(mls) => {
+            mls.0
+                .iter()
+                .filter(|ls| ls.0.len() >= 2)
+                .map(|ls| ls.0.iter().map(|c| [c.x, c.y]).collect())
+                .collect()
+        }
+        other => return other.clone(),
+    };
+
+    if paths.is_empty() || shapes.is_empty() {
+        return geom.clone();
+    }
+
+    let overlay = FloatStringOverlay::with_shape_and_string(shapes, &paths);
+    let clipped: Vec<Vec<[f64; 2]>> = overlay.clip_string_lines_with_solver(
+        FillRule::NonZero,
+        ClipRule {
+            invert: false,
+            boundary_included: true,
+        },
+        Solver::default(),
+    );
+
+    if clipped.is_empty() {
+        geo::Geometry::LineString(geo::LineString::new(vec![]))
+    } else if clipped.len() == 1 {
+        let coords: Vec<geo::Coord<f64>> = clipped[0]
+            .iter()
+            .map(|pt| geo::Coord { x: pt[0], y: pt[1] })
+            .collect();
+        geo::Geometry::LineString(geo::LineString::new(coords))
+    } else {
+        let lines: Vec<geo::LineString<f64>> = clipped
+            .into_iter()
+            .map(|pts| {
+                let coords = pts.into_iter().map(|pt| geo::Coord { x: pt[0], y: pt[1] }).collect();
+                geo::LineString::new(coords)
+            })
+            .collect();
+        geo::Geometry::MultiLineString(geo::MultiLineString::new(lines))
     }
 }
 
@@ -450,26 +522,29 @@ fn multipolygon_json(mp: &geo::MultiPolygon<f64>) -> Value {
     json!({ "type": "MultiPolygon", "coordinates": polys })
 }
 
-/// Simplify a reach centreline for display; non-linear input passes through.
-fn simplify_geometry(g: &geo::Geometry<f64>, tol: f64) -> geo::Geometry<f64> {
-    use geo::Simplify;
-    match g {
-        geo::Geometry::LineString(ls) => geo::Geometry::LineString(ls.simplify(&tol)),
-        geo::Geometry::MultiLineString(mls) => geo::Geometry::MultiLineString(mls.simplify(&tol)),
-        other => other.clone(),
-    }
-}
-
-/// GeoJSON geometry for a reach centreline; non-linear input yields `null`.
+/// GeoJSON geometry for a reach centreline; non-linear or empty input yields `null`.
 fn line_json(g: &geo::Geometry<f64>) -> Value {
     match g {
         geo::Geometry::LineString(ls) => {
-            json!({ "type": "LineString", "coordinates": ring_json(ls) })
+            if ls.0.is_empty() {
+                Value::Null
+            } else {
+                json!({ "type": "LineString", "coordinates": ring_json(ls) })
+            }
         }
-        geo::Geometry::MultiLineString(mls) => json!({
-            "type": "MultiLineString",
-            "coordinates": mls.0.iter().map(ring_json).collect::<Vec<_>>()
-        }),
+        geo::Geometry::MultiLineString(mls) => {
+            let valid_lines: Vec<_> = mls.0.iter().filter(|ls| !ls.0.is_empty()).collect();
+            if valid_lines.is_empty() {
+                Value::Null
+            } else if valid_lines.len() == 1 {
+                json!({ "type": "LineString", "coordinates": ring_json(valid_lines[0]) })
+            } else {
+                json!({
+                    "type": "MultiLineString",
+                    "coordinates": valid_lines.iter().map(|ls| ring_json(ls)).collect::<Vec<_>>()
+                })
+            }
+        }
         _ => Value::Null,
     }
 }

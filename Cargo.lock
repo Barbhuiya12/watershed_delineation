@@ -1301,6 +1301,7 @@ version = "1.0.0"
 dependencies = [
  "geo",
  "hfx",
+ "i_overlay",
  "pourpoint-core",
  "serde_json",
 ]
