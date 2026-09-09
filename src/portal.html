@@ -1228,6 +1228,7 @@ themeToggle.addEventListener("click", () => {
 
 /* ── Map Setup ── */
 const map = L.map("map", { zoomControl: false, worldCopyJump: true }).setView([22.0, 79.5], 5);
+window.map = map;
 L.control.zoom({ position: "topright" }).addTo(map);
 L.control.scale({ imperial: false, position: "bottomright" }).addTo(map);
 
@@ -1548,23 +1549,40 @@ function renderResults(d, ms) {
   // River network linework (with high-resolution spline smoothing)
   renderReaches(d.geometry.reaches);
 
-  // Requested outlet marker
-  L.circleMarker([d.input.lat, d.input.lon], {
-    radius: 5,
-    color: "#d97706",
-    weight: 2,
-    fillColor: "#ffffff",
-    fillOpacity: 1
-  }).bindTooltip("Requested Input Point").addTo(gOutlets);
+  // Check snap offset distance
+  const snapDistM = L.latLng(d.input.lat, d.input.lon).distanceTo(L.latLng(d.resolved.lat, d.resolved.lon));
+  if (snapDistM > 25) {
+    const distLabel = snapDistM >= 1000 ? (snapDistM / 1000).toFixed(2) + " km" : snapDistM.toFixed(0) + " m";
+    // Snap vector dashed link
+    L.polyline([[d.input.lat, d.input.lon], [d.resolved.lat, d.resolved.lon]], {
+      color: "#d97706",
+      weight: 2,
+      dashArray: "4, 6",
+      opacity: 0.85
+    }).bindTooltip(`Snapped to River (${distLabel})`).addTo(gOutlets);
 
-  // Snapped outlet marker
-  L.circleMarker([d.resolved.lat, d.resolved.lon], {
+    // Requested input point marker
+    L.circleMarker([d.input.lat, d.input.lon], {
+      radius: 5,
+      color: "#d97706",
+      weight: 2,
+      fillColor: "#ffffff",
+      fillOpacity: 1
+    }).bindTooltip(`Clicked Point (${distLabel} from river channel)`).addTo(gOutlets);
+  }
+
+  // Snapped outlet marker (Pour Point on Watershed Divide)
+  const outletMarker = L.circleMarker([d.resolved.lat, d.resolved.lon], {
     radius: 7,
-    color: "#2563eb",
+    color: "#1e40af",
     weight: 2.5,
     fillColor: "#2563eb",
-    fillOpacity: 0.9
-  }).bindTooltip("Snapped River Outlet").addTo(gOutlets);
+    fillOpacity: 0.95
+  }).bindTooltip("Pour Point (Hydrologic Outlet) · Click to zoom in").addTo(gOutlets);
+
+  outletMarker.on("click", () => {
+    map.setView([d.resolved.lat, d.resolved.lon], 16);
+  });
 
   try {
     map.fitBounds(basinLayer.getBounds(), { padding: [40, 40] });
@@ -1629,6 +1647,11 @@ function buildReportDOM(d, totalMs) {
         </div>
         <div class="status-card-desc">
           ${d.escalated ? `Snapped to ${(d.radius_used_m / 1000).toFixed(0)} km flowline (distance: ${num(+dist, 1)} m)` : 'Snapped directly to on-channel flowline'}
+          <div style="margin-top: 6px;">
+            <button class="btn btn-outline" style="padding: 3px 10px; font-size: 11px; height: 26px; border-radius: 6px; cursor: pointer;" onclick="window.map.setView([${d.resolved.lat}, ${d.resolved.lon}], 16)">
+              🔍 Inspect Pour Point & Divide
+            </button>
+          </div>
         </div>
       </div>
     </div>

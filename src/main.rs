@@ -28,7 +28,9 @@ use pourpoint_core::session::DatasetSession;
 use pourpoint_core::{DelineationOptions, Engine, LevelSelection, RefinementMode};
 use serde_json::{Value, json};
 use i_overlay::core::fill_rule::FillRule;
+use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::core::solver::Solver;
+use i_overlay::float::overlay::FloatOverlay;
 use i_overlay::float::string_overlay::FloatStringOverlay;
 use i_overlay::string::clip::ClipRule;
 
@@ -36,13 +38,7 @@ const INDEX_HTML: &str = include_str!("portal.html");
 const DEFAULT_PORT: u16 = 8787;
 
 /// Search radii tried in order when the caller does not pin one.
-///
-/// A map click lands wherever the cursor was, which is routinely a few hundred
-/// metres off any channel — and on a wide river, several kilometres. Failing
-/// the first attempt is correct engine behaviour; refusing to widen is bad app
-/// behaviour. The response reports which radius won and how far it reached, so
-/// a suspiciously distant snap stays visible rather than silently accepted.
-const RADIUS_LADDER: [f64; 4] = [1_000.0, 5_000.0, 20_000.0, 50_000.0];
+const RADIUS_LADDER: [f64; 5] = [100.0, 300.0, 1_000.0, 5_000.0, 20_000.0];
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut dataset = env::var("INCLINE_DATASET_PATH")
@@ -333,30 +329,90 @@ fn delineate(engine: &Engine, q: &HashMap<String, String>) -> (u16, Value) {
         result.geometry().clone()
     };
 
-    let shapes = multipolygon_to_shapes(&display_watershed);
-
     let terminal_id = units.terminal();
     let res_coord = [result.resolved_outlet().lon, result.resolved_outlet().lat];
+
+    // Find the terminal reach: first try by unit_id == terminal_id, fallback to reach closest to res_coord
+    let term_reach_idx = reaches
+        .reaches()
+        .iter()
+        .position(|r| r.unit_id() == terminal_id)
+        .or_else(|| {
+            let mut best_idx = None;
+            let mut best_d = f64::INFINITY;
+            for (idx, r) in reaches.reaches().iter().enumerate() {
+                match r.geometry() {
+                    geo::Geometry::LineString(ls) => {
+                        for pt in &ls.0 {
+                            let d = dist_sq(res_coord, [pt.x, pt.y]);
+                            if d < best_d {
+                                best_d = d;
+                                best_idx = Some(idx);
+                            }
+                        }
+                    }
+                    geo::Geometry::MultiLineString(mls) => {
+                        for ls in &mls.0 {
+                            for pt in &ls.0 {
+                                let d = dist_sq(res_coord, [pt.x, pt.y]);
+                                if d < best_d {
+                                    best_d = d;
+                                    best_idx = Some(idx);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            best_idx
+        });
 
     let other_geom_refs: Vec<&geo::Geometry<f64>> = reaches
         .reaches()
         .iter()
-        .filter(|r| r.unit_id() != terminal_id)
-        .map(|r| r.geometry())
+        .enumerate()
+        .filter(|(idx, _)| Some(*idx) != term_reach_idx)
+        .map(|(_, r)| r.geometry())
         .collect();
+
+    let term_reach_geom = term_reach_idx.map(|idx| {
+        truncate_terminal_reach(reaches.reaches()[idx].geometry(), res_coord, &other_geom_refs)
+    });
+
+    let display_watershed = if let Some(idx) = term_reach_idx {
+        let orig_geom = reaches.reaches()[idx].geometry();
+        slice_watershed_at_outlet(&display_watershed, res_coord, orig_geom)
+    } else {
+        // Fallback: search all reaches for closest stream direction to res_coord
+        let mut best_dir = None;
+        for r in reaches.reaches() {
+            if let Some(d) = get_stream_direction_at_outlet(r.geometry(), res_coord) {
+                best_dir = Some(d);
+                break;
+            }
+        }
+        if let Some((dx, dy)) = best_dir {
+            slice_watershed_with_dir(&display_watershed, res_coord, dx, dy)
+        } else {
+            display_watershed
+        }
+    };
+
+    let shapes = multipolygon_to_shapes(&display_watershed);
 
     let reach_features: Vec<Value> = reaches
         .reaches()
         .iter()
-        .filter_map(|reach| {
-            let base_geom = if reach.unit_id() == terminal_id {
-                truncate_terminal_reach(reach.geometry(), res_coord, &other_geom_refs)
+        .enumerate()
+        .filter_map(|(idx, reach)| {
+            let base_geom = if Some(idx) == term_reach_idx {
+                let term = term_reach_geom.clone().unwrap_or_else(|| reach.geometry().clone());
+                clip_reach_geometry(&term, &shapes)
             } else {
                 reach.geometry().clone()
             };
-            // Strictly clip reach linework against the watershed polygon boundary
-            let clipped = clip_reach_geometry(&base_geom, &shapes);
-            let geom_json = line_json(&clipped);
+            let geom_json = line_json(&base_geom);
             if geom_json.is_null() {
                 return None;
             }
@@ -550,17 +606,154 @@ fn truncate_terminal_reach(
     }
 }
 
+/// Slice the watershed MultiPolygon at the resolved outlet point perpendicular to the
+/// stream direction, ensuring the watershed divide closes PRECISELY at the outlet marker
+/// with 0 distance and 0 downstream overshoot.
+/// Find the downstream flow direction tangent at the outlet by finding the stream
+/// segment closest to res_pt. Works for any LineString or MultiLineString geometry.
+fn get_stream_direction_at_outlet(
+    geom: &geo::Geometry<f64>,
+    res_pt: [f64; 2],
+) -> Option<(f64, f64)> {
+    let mut best_dir = None;
+    let mut best_dist_sq = f64::INFINITY;
+
+    let mut check_linestring = |ls: &geo::LineString<f64>| {
+        for i in 0..(ls.0.len().saturating_sub(1)) {
+            let p1 = [ls.0[i].x, ls.0[i].y];
+            let p2 = [ls.0[i + 1].x, ls.0[i + 1].y];
+            let dx = p2[0] - p1[0];
+            let dy = p2[1] - p1[1];
+            let mag = dx.hypot(dy);
+            if mag < 1e-9 {
+                continue;
+            }
+            let (proj, _) = project_point_to_segment(res_pt, p1, p2);
+            let d = dist_sq(res_pt, proj);
+            if d < best_dist_sq {
+                best_dist_sq = d;
+                best_dir = Some((dx / mag, dy / mag));
+            }
+        }
+    };
+
+    match geom {
+        geo::Geometry::LineString(ls) => check_linestring(ls),
+        geo::Geometry::MultiLineString(mls) => {
+            for ls in &mls.0 {
+                check_linestring(ls);
+            }
+        }
+        _ => {}
+    }
+
+    best_dir
+}
+
+/// Slice the watershed MultiPolygon at the resolved outlet point perpendicular to the
+/// stream direction, ensuring the watershed divide closes PRECISELY at the outlet marker
+/// with 0 distance and 0 downstream overshoot.
+fn slice_watershed_at_outlet(
+    mp: &geo::MultiPolygon<f64>,
+    res_pt: [f64; 2],
+    terminal_reach_geom: &geo::Geometry<f64>,
+) -> geo::MultiPolygon<f64> {
+    let dir = get_stream_direction_at_outlet(terminal_reach_geom, res_pt);
+
+    let Some((dx, dy)) = dir else {
+        return mp.clone();
+    };
+    slice_watershed_with_dir(mp, res_pt, dx, dy)
+}
+
+fn slice_watershed_with_dir(
+    mp: &geo::MultiPolygon<f64>,
+    res_pt: [f64; 2],
+    dx: f64,
+    dy: f64,
+) -> geo::MultiPolygon<f64> {
+    let nx = -dy;
+    let ny = dx;
+
+    let span = 15.0; // degrees (~1500 km)
+    let upstream_span = 30.0; // degrees (~3000 km)
+
+    let p_left = [res_pt[0] - nx * span, res_pt[1] - ny * span];
+    let p_right = [res_pt[0] + nx * span, res_pt[1] + ny * span];
+    let p_back_right = [p_right[0] - dx * upstream_span, p_right[1] - dy * upstream_span];
+    let p_back_left = [p_left[0] - dx * upstream_span, p_left[1] - dy * upstream_span];
+
+    // i_overlay contours must NOT have duplicate closing points (4 distinct vertices)
+    let cutter_poly: Vec<[f64; 2]> = vec![p_left, p_right, p_back_right, p_back_left];
+    let cutter_shape: Vec<Vec<Vec<[f64; 2]>>> = vec![vec![cutter_poly]];
+
+    let shapes = multipolygon_to_shapes(mp);
+    let overlay = FloatOverlay::with_subj_and_clip(&shapes, &cutter_shape);
+    let sliced_shapes = overlay.overlay(OverlayRule::Intersect, FillRule::NonZero);
+
+    if sliced_shapes.is_empty() {
+        return mp.clone();
+    }
+
+    shapes_to_multipolygon(&sliced_shapes)
+}
+
+/// Convert `i_overlay` shapes `Vec<Vec<Vec<[f64; 2]>>>` back to `geo::MultiPolygon<f64>`.
+fn shapes_to_multipolygon(shapes: &Vec<Vec<Vec<[f64; 2]>>>) -> geo::MultiPolygon<f64> {
+    let mut polys = Vec::new();
+    for shape in shapes {
+        if shape.is_empty() || shape[0].len() < 3 {
+            continue;
+        }
+        let mut ext_pts: Vec<geo::Coord<f64>> = shape[0]
+            .iter()
+            .map(|pt| geo::Coord { x: pt[0], y: pt[1] })
+            .collect();
+        if let (Some(first), Some(last)) = (ext_pts.first(), ext_pts.last()) {
+            if first != last {
+                ext_pts.push(*first);
+            }
+        }
+        let exterior = geo::LineString::new(ext_pts);
+        let interiors: Vec<geo::LineString<f64>> = shape[1..]
+            .iter()
+            .filter(|ring| ring.len() >= 3)
+            .map(|ring| {
+                let mut int_pts: Vec<geo::Coord<f64>> = ring
+                    .iter()
+                    .map(|pt| geo::Coord { x: pt[0], y: pt[1] })
+                    .collect();
+                if let (Some(first), Some(last)) = (int_pts.first(), int_pts.last()) {
+                    if first != last {
+                        int_pts.push(*first);
+                    }
+                }
+                geo::LineString::new(int_pts)
+            })
+            .collect();
+        polys.push(geo::Polygon::new(exterior, interiors));
+    }
+    geo::MultiPolygon::new(polys)
+}
+
 /// Convert a `geo::MultiPolygon<f64>` into `i_overlay` shapes `Vec<Vec<Vec<[f64; 2]>>>`.
+/// Removes duplicate closing vertices so `i_overlay` solvers receive valid open contours.
 fn multipolygon_to_shapes(mp: &geo::MultiPolygon<f64>) -> Vec<Vec<Vec<[f64; 2]>>> {
     mp.0.iter()
         .map(|poly| {
             let mut contours = Vec::with_capacity(1 + poly.interiors().len());
-            // Exterior ring
-            let ext: Vec<[f64; 2]> = poly.exterior().coords().map(|c| [c.x, c.y]).collect();
+            // Exterior ring (strip closing duplicate point for i_overlay)
+            let mut ext: Vec<[f64; 2]> = poly.exterior().coords().map(|c| [c.x, c.y]).collect();
+            if ext.len() > 1 && ext[0] == ext[ext.len() - 1] {
+                ext.pop();
+            }
             contours.push(ext);
             // Interior rings (holes)
             for interior in poly.interiors() {
-                let hole: Vec<[f64; 2]> = interior.coords().map(|c| [c.x, c.y]).collect();
+                let mut hole: Vec<[f64; 2]> = interior.coords().map(|c| [c.x, c.y]).collect();
+                if hole.len() > 1 && hole[0] == hole[hole.len() - 1] {
+                    hole.pop();
+                }
                 contours.push(hole);
             }
             contours
