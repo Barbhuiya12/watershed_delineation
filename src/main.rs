@@ -380,24 +380,10 @@ fn delineate(engine: &Engine, q: &HashMap<String, String>) -> (u16, Value) {
         truncate_terminal_reach(reaches.reaches()[idx].geometry(), res_coord, &other_geom_refs)
     });
 
-    let display_watershed = if let Some(idx) = term_reach_idx {
-        let orig_geom = reaches.reaches()[idx].geometry();
-        slice_watershed_at_outlet(&display_watershed, res_coord, orig_geom)
-    } else {
-        // Fallback: search all reaches for closest stream direction to res_coord
-        let mut best_dir = None;
-        for r in reaches.reaches() {
-            if let Some(d) = get_stream_direction_at_outlet(r.geometry(), res_coord) {
-                best_dir = Some(d);
-                break;
-            }
-        }
-        if let Some((dx, dy)) = best_dir {
-            slice_watershed_with_dir(&display_watershed, res_coord, dx, dy)
-        } else {
-            display_watershed
-        }
-    };
+    // Preserve the complete true topographical watershed divide. Slicing with a global half-plane
+    // cuts off meandering basins and tributary arms that wrap around mountain ranges (e.g. Sutlej).
+    // The terminal reach itself is cleanly truncated at res_coord by truncate_terminal_reach.
+    let display_watershed = display_watershed;
 
     let shapes = multipolygon_to_shapes(&display_watershed);
 
@@ -611,6 +597,7 @@ fn truncate_terminal_reach(
 /// with 0 distance and 0 downstream overshoot.
 /// Find the downstream flow direction tangent at the outlet by finding the stream
 /// segment closest to res_pt. Works for any LineString or MultiLineString geometry.
+#[allow(dead_code)]
 fn get_stream_direction_at_outlet(
     geom: &geo::Geometry<f64>,
     res_pt: [f64; 2],
@@ -650,9 +637,7 @@ fn get_stream_direction_at_outlet(
     best_dir
 }
 
-/// Slice the watershed MultiPolygon at the resolved outlet point perpendicular to the
-/// stream direction, ensuring the watershed divide closes PRECISELY at the outlet marker
-/// with 0 distance and 0 downstream overshoot.
+#[allow(dead_code)]
 fn slice_watershed_at_outlet(
     mp: &geo::MultiPolygon<f64>,
     res_pt: [f64; 2],
@@ -666,6 +651,7 @@ fn slice_watershed_at_outlet(
     slice_watershed_with_dir(mp, res_pt, dx, dy)
 }
 
+#[allow(dead_code)]
 fn slice_watershed_with_dir(
     mp: &geo::MultiPolygon<f64>,
     res_pt: [f64; 2],
@@ -698,7 +684,7 @@ fn slice_watershed_with_dir(
     shapes_to_multipolygon(&sliced_shapes)
 }
 
-/// Convert `i_overlay` shapes `Vec<Vec<Vec<[f64; 2]>>>` back to `geo::MultiPolygon<f64>`.
+#[allow(dead_code)]
 fn shapes_to_multipolygon(shapes: &Vec<Vec<Vec<[f64; 2]>>>) -> geo::MultiPolygon<f64> {
     let mut polys = Vec::new();
     for shape in shapes {
